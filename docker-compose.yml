@@ -1,0 +1,83 @@
+# Tek komut: docker compose up --build   ->  http://localhost:8000
+# Değerler .env dosyasından gelir (bkz. .env.example); dosya yoksa aşağıdaki demo varsayılanları kullanılır.
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-crew}:${POSTGRES_PASSWORD:-crew}@postgres:5432/${POSTGRES_DB:-crewreopt}
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-crew}:${RABBITMQ_PASSWORD:-crew}@rabbitmq:5672/%2F
+  API_KEY: ${API_KEY:-demo-key}
+  OPS_DATE: ${OPS_DATE:-2026-11-23}
+  SOLVER_TIME_LIMIT_S: ${SOLVER_TIME_LIMIT_S:-10}
+  MIN_REST: ${MIN_REST:-60}
+  MAX_DUTY: ${MAX_DUTY:-780}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  PUBLIC_URL: ${PUBLIC_URL:-}
+
+x-app-build: &app-build
+  context: .
+  args:
+    GIT_SHA: ${GIT_SHA:-dev}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crew}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crew}
+      POSTGRES_DB: ${POSTGRES_DB:-crewreopt}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-crew}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-crew}
+    ports:
+      - "15672:15672" # yönetim arayüzü: kuyruk derinliği, ack bekleyen mesajlar
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq # durable kuyruk + persistent mesajlar yeniden başlatmadan sağ çıkar
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  seed: # bir kez çalışır: tablolar boşsa demo verisini yükler, doluysa dokunmaz
+    build: *app-build
+    command: ["python", "-m", "app.seed", "--if-empty"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: *app-build
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      seed: { condition: service_completed_successfully }
+      rabbitmq: { condition: service_healthy }
+    healthcheck: # /health hem veritabanını hem kuyruğu yoklar
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build: *app-build
+    command: ["python", "-m", "app.worker"]
+    environment: *app-env
+    depends_on:
+      seed: { condition: service_completed_successfully }
+      rabbitmq: { condition: service_healthy }
+    restart: unless-stopped # çökerse yeniden başlar; yarım kalan iş kuyruktan geri gelir
+
+volumes:
+  pgdata:
+  rabbitdata:

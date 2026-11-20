@@ -64,12 +64,14 @@ ruff check . && pytest -q
 | Dosya | Sorumluluk |
 |---|---|
 | `app/aftn.py` | ICAO Doc 4444 DLA / CNL / DEP / ARR ayrıştırıcı. Saf. |
+| `app/notam.py` | NOTAM ayrıştırıcı: meydan kapanışı (QFALC). Saf. |
 | `app/model.py` | CP-SAT modeli, değişiklik gerekçesi, çözümsüzlük teşhisi. Saf. |
 | `app/db.py` | Şema (tek dosya) ve paylaşılan sorgular. |
 | `app/api.py` | HTTP uçları, idempotent iş oluşturma, dead-letter. |
 | `app/broker.py` | RabbitMQ: durable kuyruk, persistent mesaj, publisher confirm. |
 | `app/worker.py` | İşi sahiplen, çöz, yaz, en sonda ack. |
-| `app/seed.py` | Demo verisi: 14 görev, 7 ekip (2 yedek). |
+| `app/seed.py` | Demo verisi: 14 görev, 7 ekip (2 yedek); fırtına için 150 görevlik büyük gün üreteci. |
+| `app/live.py` | İsteğe bağlı canlı THY uçak konumları (OpenSky), önbellekli. |
 
 ## Model
 
@@ -121,6 +123,31 @@ C1 ekibi P01'i (THY1591/1592) uçup 14:10'da dönecek, 15:15'te P02'ye çıkacak
 dönüş 15:40 olur; dinlenme −25 dk. O saatte boşta normal ekip yok, bu yüzden tek bir görev yedek ekibe geçer.
 Beklenen: 1 değişiklik, amaç 130 (100 + 30), `OPTIMAL`.
 
+### 3) Fırtına: NOTAM ile meydan kapanışı, uzun süren iş, çökme provası
+
+Arayüzdeki **Fırtına senaryosu** kartındaki üç düğme sırayla:
+
+1. **Büyük günü yükle:** 150 görev, 97 ekip (25 yedek). Aynı tohumla hep aynı plan üretilir.
+2. **Çökme provasını kur** (isteğe bağlı): worker, işi 2 saniye çalıştırdıktan sonra kendini aniden kapatır.
+3. **NOTAM gönder:** İstanbul 08:00–10:00 kapalı.
+
+```
+GG LTFMYNYX
+230700 LTAAYNYX
+(A1234/26 NOTAMN
+Q) LTBB/QFALC/IV/NBO/A/000/999/4116N02844E005
+A) LTFM B) 2611230800 C) 2611231000
+E) AD CLSD DUE TO HEAVY SNOW)
+```
+
+Kapalı aralıktaki kalkış ve inişler açılışa ertelenir; 35 kural ihlali oluşur. Çözücü konteynerde yaklaşık
+10 saniye çalışır; arayüz amaç ve en iyi sınırın yaklaşmasını canlı gösterir. Sonuç: 28 görevin ekibi
+değişir, 13 yedek devreye girer, amaç 3190, `OPTIMAL`. Çökme provası kuruluysa worker logunda şu sıra görünür:
+`job claimed (attempts 1)` → `chaos: killing worker mid-job` → `job claimed (attempts 2, redelivered true)` →
+`job finished (succeeded)`.
+
+Desteklenen tek NOTAM türü meydan kapanışıdır (Q-kodu `QFALC`); diğerleri nedeniyle birlikte dead-letter olur.
+
 ### 2) İptal: THY2412 iptal olur
 
 ```
@@ -148,7 +175,23 @@ Denemeye değer diğer şeyler: aynı mesajı iki kez göndermek (`"duplicate": 
 (`(DLA-THY1591-LTFM2460-EDDF-DOF/261123)` → 422); çözüm sırasında `docker compose kill worker`
 (iş yeniden teslim edilir ve tamamlanır); `docker compose logs worker` (JSON loglar).
 
+## Arayüzde ayrıca
+
+- **Tanıtım turu:** ilk açılışta başlar, ekranı adım adım anlatır ve örnek gecikmeyi oynatır.
+- **Harita:** İstanbul çıkışlı rotalar; geciken, iptal olan ve ekibi değişen görevler renkle ayrılır.
+  Altlık Natural Earth verisinden üretilir (kamu malı; `scripts/build_map.py`).
+- **Canlı katman (isteğe bağlı, `LIVE_TRAFFIC=1`):** haritada o an havada olan THY çağrı kodlu uçaklar.
+  Kaynak OpenSky Network (ADS-B); 15 dakikada bir çekilir, arada konumlar hız ve yöne göre ilerletilir.
+  Bu katman yalnızca görseldir: plan, ekipler ve senaryolar uydurmadır ve bu veriye bağlı değildir.
+- **Görev detayı:** bir göreve tıklayınca hangi ekibin uçabileceği, uçamıyorsa hangi kuralın bozulduğu.
+- **Ağırlıklarla yeniden çözme:** değişiklik ve yedek maliyetini değiştirip kararın nasıl döndüğünü görmek.
+- **QR:** `PUBLIC_URL` ayarlıysa sayfanın adresi QR olarak gösterilir.
+
+Docker olmadan arayüze bakmak için: `python scripts/local_preview.py` (SQLite, kuyruk yok).
+
 ## Bilinçli basitleştirmeler
+
+- Meydan kapanışında ertelenen bütün uçuşlar açılış anına yığılır; gerçekte pist kapasitesine göre sıralanır.
 
 - Bir bacak iptal olursa gidiş-dönüş görevin tamamı iptal sayılır.
 - Gecikme, aynı görevin sonraki bacaklarına aynen yansır (yerde kalış süresi sabit).

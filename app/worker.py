@@ -3,12 +3,14 @@
 # Entegrasyon kodu burada; model.solve saf kalır (ne veritabanını ne kuyruğu bilir).
 import json
 import logging
+import os
 import signal
+import threading
 import time
 from dataclasses import asdict
 
 import pika
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.engine import Engine
 
 from app import broker, config, db, logging_json, model
@@ -71,8 +73,19 @@ def run_job(engine: Engine, settings: config.Settings, job_id: str, redelivered:
         )
     log(logger, logging.INFO, "input loaded", job_id=job_id, pairings=len(pairings), violations=broken)
 
-    # 2) Modeli çalıştır (saf fonksiyon)
-    result = model.solve(pairings, crews, rules)
+    # 2) Modeli çalıştır (saf fonksiyon). Çözüm sürerken bulunan her çözüm iş kaydına yazılır:
+    #    arayüz uzun süren işte amaç ve sınırın yaklaşmasını canlı gösterir.
+    last_write = 0.0
+
+    def on_progress(points: list[dict]) -> None:
+        nonlocal last_write
+        if time.monotonic() - last_write < 0.3:  # veritabanını her çözümde değil, saniyede birkaç kez yaz
+            return
+        last_write = time.monotonic()
+        with engine.begin() as conn:
+            conn.execute(update(db.jobs).where(db.jobs.c.id == job_id).values(trace=list(points)))
+
+    result = model.solve(pairings, crews, rules, on_progress)
 
     # 3) Çözücü durumunu iş durumuna çevir
     error = None
@@ -114,6 +127,20 @@ def run_job(engine: Engine, settings: config.Settings, job_id: str, redelivered:
     return status
 
 
+def chaos_watchdog(engine: Engine, job_id: str, done: threading.Event) -> None:
+    """Çökme provası (sadece demo): API 'kill_worker' bayrağını koyduysa, iş 2 saniyedir sürerken süreci öldürür.
+    os._exit temizlik yapmaz: ack gitmez, bağlantı kopar. Gerçek bir çökmeyle aynı sonuç: broker mesajı
+    yeniden teslim eder, yeniden başlayan worker işi devralır."""
+    done.wait(2)
+    while not done.is_set():
+        with engine.begin() as conn:
+            armed = conn.execute(delete(db.flags).where(db.flags.c.name == "kill_worker")).rowcount
+        if armed:  # bayrak silindi: ikinci denemede tekrar ölmeyiz
+            log(logger, logging.ERROR, "chaos: killing worker mid-job", job_id=job_id)
+            os._exit(1)
+        done.wait(0.5)
+
+
 def main() -> None:
     settings = config.load()
     logging_json.setup(settings.log_level)
@@ -133,11 +160,15 @@ def main() -> None:
             log(logger, logging.ERROR, "unreadable queue message dropped", body=body[:200])
             channel.basic_ack(method.delivery_tag)
             return
+        done = threading.Event()
+        threading.Thread(target=chaos_watchdog, args=(engine, job_id, done), daemon=True).start()
         try:
             run_job(engine, settings, job_id, method.redelivered)
         except Exception as exc:  # modelden ya da koddan beklenmeyen hata: işi 'failed' yap, kuyruğu tıkama
             logger.exception("job crashed", extra={"job_id": job_id})
             finish(engine, job_id, "failed", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            done.set()
         # ack EN SONDA: buraya gelmeden süreç ölürse broker mesajı başka bir worker'a verir
         channel.basic_ack(method.delivery_tag)
 

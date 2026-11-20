@@ -1,6 +1,7 @@
 # Demo verisi: 23.11.2026, LTFM çıkışlı 14 gidiş-dönüş görev, 7 ekip (C1-C5 normal, S1-S2 yedek).
 # Tüm uçuşlar uydurmadır (THY çağrı kodu biçimi ve gerçek ICAO meydan kodları kullanıldı).
 # Kurgu: C1'in P01 (THY1591) dönüşü 14:10, P02 kalkışı 15:15 -> 65 dk dinlenme; 90 dk gecikme bunu bozar.
+import random
 import sys
 from datetime import date
 
@@ -36,23 +37,69 @@ def minutes(hhmm: str) -> int:
     return int(h) * 60 + int(m)
 
 
-def load(engine: Engine) -> None:
-    """Tabloları boşaltıp demo verisini yükler. Prova sırasında tekrar tekrar çalıştırılabilir."""
+def hhmm(total: int) -> str:
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+# Büyük gün için tek yön uçuş süreleri (dk); yerde kalış 60 dk
+BLOCK = {"EDDF": 190, "LOWW": 135, "LYBE": 105, "LTCG": 105, "LWSK": 95, "LROP": 90,
+         "LGAV": 85, "LTAI": 80, "LBSF": 75, "LTAC": 65, "LTBJ": 65}  # fmt: skip
+
+
+def big_day(n_pairings: int = 150, n_standby: int = 25, rng_seed: int = 7) -> tuple[list, list]:
+    """Fırtına senaryosu için büyük bir gün üretir: aynı tohumla hep aynı plan (tekrarlanabilir demo).
+    Görevler rastgele saatlere dağıtılır, sonra sıkı ama kurallara uyan bir başlangıç planı kurulur:
+    her görev, 65 dk dinlenmeyle araya sığan ve en geç boşalan ekibe verilir; yoksa yeni ekip açılır."""
+    rng = random.Random(rng_seed)
+    drafts = []
+    for i in range(n_pairings):
+        dest = rng.choice(list(BLOCK))
+        block = BLOCK[dest]
+        start = rng.randrange(4 * 60, 21 * 60 - 2 * block - 60, 5)  # dönüş en geç 21:00
+        legs = [
+            (f"THY{3000 + 2 * i}", "LTFM", dest, hhmm(start), hhmm(start + block)),
+            (f"THY{3001 + 2 * i}", dest, "LTFM", hhmm(start + block + 60), hhmm(start + 2 * block + 60)),
+        ]
+        drafts.append((start, start + 2 * block + 60, legs))
+    drafts.sort(key=lambda d: d[0])
+
+    crews = []  # her ekip: [son görevin bitişi, toplam görev süresi]
+    pairings = []
+    for number, (start, end, legs) in enumerate(drafts, start=1):
+        fits = [i for i, (free_at, duty) in enumerate(crews) if free_at + 65 <= start and duty + end - start <= 13 * 60]
+        if fits:
+            crew = max(fits, key=lambda i: crews[i][0])  # en geç boşalan: plan sıkı olsun
+            crews[crew] = [end, crews[crew][1] + end - start]
+        else:
+            crews.append([end, end - start])
+            crew = len(crews) - 1
+        pairings.append((f"P{number:03d}", f"C{crew + 1:02d}", legs))
+    crew_rows = [(f"C{i + 1:02d}", False) for i in range(len(crews))] + [(f"S{i + 1}", True) for i in range(n_standby)]
+    return crew_rows, pairings
+
+
+def load(engine: Engine, crews: list | None = None, pairings: list | None = None) -> None:
+    """Tabloları boşaltıp veriyi yükler (varsayılan: 14 görevlik demo). Tekrar tekrar çalıştırılabilir."""
+    crews = crews or CREWS
+    pairings = pairings or PAIRINGS
     db.init_db(engine)
     with engine.begin() as conn:
-        for table in (db.dead_letters, db.jobs, db.assignments, db.flights, db.crews):
+        for table in (db.flags, db.dead_letters, db.jobs, db.assignments, db.flights, db.crews):
             conn.execute(delete(table))
-        conn.execute(insert(db.crews), [{"id": c, "is_standby": s} for c, s in CREWS])
-        for pairing_id, crew_id, legs in PAIRINGS:
-            conn.execute(insert(db.assignments).values(pairing_id=pairing_id, crew_id=crew_id))
-            for leg_no, (callsign, adep, ades, std, sta) in enumerate(legs, start=1):
-                conn.execute(
-                    insert(db.flights).values(
-                        pairing_id=pairing_id, leg_no=leg_no, callsign=callsign, dof=OPS_DATE,
-                        adep=adep, ades=ades, std_min=minutes(std), sta_min=minutes(sta),
-                        orig_std_min=minutes(std), status="SCHEDULED",
-                    )
-                )
+        conn.execute(insert(db.crews), [{"id": c, "is_standby": s} for c, s in crews])
+        conn.execute(insert(db.assignments), [{"pairing_id": p, "crew_id": c} for p, c, _ in pairings])
+        conn.execute(
+            insert(db.flights),
+            [
+                {
+                    "pairing_id": pairing_id, "leg_no": leg_no, "callsign": callsign, "dof": OPS_DATE,
+                    "adep": adep, "ades": ades, "std_min": minutes(std), "sta_min": minutes(sta),
+                    "orig_std_min": minutes(std), "status": "SCHEDULED",
+                }
+                for pairing_id, _, legs in pairings
+                for leg_no, (callsign, adep, ades, std, sta) in enumerate(legs, start=1)
+            ],
+        )
 
 
 if __name__ == "__main__":

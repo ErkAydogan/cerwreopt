@@ -98,9 +98,10 @@ def _clean(value: float) -> float:
 class _Trace(cp_model.CpSolverSolutionCallback):
     """Çözücü her daha iyi çözüm bulduğunda amaç ve sınırı kaydeder: arayüzde gap'in kapanışı çizilir."""
 
-    def __init__(self):
+    def __init__(self, on_progress=None):
         super().__init__()
         self.points = []
+        self.on_progress = on_progress
 
     def on_solution_callback(self):
         self.points.append(
@@ -110,9 +111,11 @@ class _Trace(cp_model.CpSolverSolutionCallback):
                 "bound": _clean(self.best_objective_bound),
             }
         )
+        if self.on_progress:
+            self.on_progress(self.points)  # çağıran isterse çözüm sürerken izi dışarı yazar (ör. veritabanına)
 
 
-def solve(pairings: list[Pairing], crews: list[Crew], rules: Rules | None = None) -> SolveResult:
+def solve(pairings: list[Pairing], crews: list[Crew], rules: Rules | None = None, on_progress=None) -> SolveResult:
     rules = rules or Rules()
     active = [p for p in pairings if not p.cancelled]  # iptal edilenler modele girmez
     crew_ids = {e.id for e in crews}
@@ -143,7 +146,7 @@ def solve(pairings: list[Pairing], crews: list[Crew], rules: Rules | None = None
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = rules.time_limit_s
     solver.parameters.random_seed = 0  # aynı girdi -> aynı sonuç (demo ve testler için)
-    trace = _Trace()
+    trace = _Trace(on_progress)
     status = solver.solve(model, trace)
     result = SolveResult(solver.status_name(status), solve_seconds=solver.wall_time, trace=trace.points)
 
@@ -166,6 +169,8 @@ def solve(pairings: list[Pairing], crews: list[Crew], rules: Rules | None = None
     result.best_bound = _clean(solver.best_objective_bound)
     # Göreli boşluk: 0 ise optimum kanıtlandı. Amaç 0 iken bölme yapmıyoruz.
     result.gap = 0.0 if result.objective == 0 else abs(result.objective - result.best_bound) / abs(result.objective)
+    # İzin son noktası: çözüm bittiği andaki amaç ve sınır (sınır son çözümden sonra da iyileşmiş olabilir)
+    result.trace.append({"t": round(solver.wall_time, 3), "objective": result.objective, "bound": result.best_bound})
     return result
 
 

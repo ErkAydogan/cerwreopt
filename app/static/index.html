@@ -40,6 +40,11 @@
   .rest span { position:absolute; left:50%; top:-9px; transform:translateX(-50%); font-size:10px; padding:0 3px; background:var(--card); color:var(--muted); white-space:nowrap; }
   .rest.tight { background:var(--warn); } .rest.tight span { color:#8a6100; font-weight:600; }
   .rest.broken { background:var(--bad); height:3px; z-index:3; } .rest.broken span { color:var(--bad); font-weight:700; top:-22px; }
+  /* Büyük gün (onlarca ekip): satırlar incelir, yazılar gizlenir; renkler ve dinlenme çizgileri kalır */
+  #gantt.compact .row { height:20px; } #gantt.compact .track, #gantt.compact .leg, #gantt.compact .ghost { height:12px; }
+  #gantt.compact .leg { font-size:0; padding:0; border-radius:2px; } #gantt.compact .rest { top:5px; } #gantt.compact .rest span { display:none; }
+  #gantt.compact .duty { display:none; } #gantt.compact .meter { display:inline-block; width:60px; margin:0 0 2px 4px; }
+  #gantt.compact .name { font-size:11px; } #gantt.compact .name b { width:30px; }
   .axis { height:20px; } .axis .track span { position:absolute; font-size:11px; color:var(--muted); transform:translateX(-50%); }
   .legend span { display:inline-block; margin:8px 14px 0 0; font-size:12px; }
   .legend i { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:-2px; margin-right:4px; }
@@ -173,6 +178,16 @@
       <button onclick="resetData()">Veriyi sıfırla</button>
       <div id="response" class="mono muted"></div>
     </div>
+    <div class="card" id="card-storm">
+      <h2>Fırtına senaryosu</h2>
+      <p class="hint">Uzun süren bir optimizasyon işi: tetiklenir, izlenir, çöker ve yine de tamamlanır.</p>
+      <button onclick="loadBigDay()">1 · Büyük günü yükle</button>
+      <div class="hint" style="margin:4px 0 0">150 görev, 97 ekip (25 yedek)</div>
+      <button onclick="armChaos()">2 · Çökme provasını kur</button>
+      <div class="hint" style="margin:4px 0 0">Worker, iş 2 sn sürdükten sonra aniden kapanır (isteğe bağlı)</div>
+      <button class="primary" onclick="sendStorm()">3 · NOTAM: İstanbul 2 saat kapalı</button>
+      <div class="hint" style="margin:4px 0 0">08:00–10:00 arası kalkış ve inişler ertelenir; onlarca ekibin planı bozulur</div>
+    </div>
     <div class="card" id="card-weights">
       <h2>Ağırlıklarla yeniden çöz</h2>
       <p class="hint">Amaç = değişiklik × a + kullanılan yedek × b. Ağırlığı değiştirin, kararın nasıl döndüğünü görün.</p>
@@ -203,8 +218,10 @@
 <script src="/static/map.js"></script>  <!-- harita altlığı: scripts/build_map.py üretir -->
 <script>
 const DEMO_DLA = "FF LTFMZPZX\n231200 EDDFZQZX\n(DLA-THY1591-LTFM0830-EDDF-DOF/261123)";
+const DEMO_NOTAM = "GG LTFMYNYX\n230700 LTAAYNYX\n(A1234/26 NOTAMN\nQ) LTBB/QFALC/IV/NBO/A/000/999/4116N02844E005\n"
+  + "A) LTFM B) 2611230800 C) 2611231000\nE) AD CLSD DUE TO HEAVY SNOW)";
 const DEMO_CNL = "FF LTFMZPZX\n231210 LTAIZPZX\n(CNL-THY2412-LTFM1500-LTAI-DOF/261123)";
-const DAY_START = 4 * 60, DAY_END = 22 * 60;            // çizelgede gösterilen aralık (dakika)
+const DAY_START = 4 * 60, DAY_END = 24 * 60;            // çizelgede gösterilen aralık (dakika)
 const TIGHT_MARGIN = 15;                                 // dinlenme sınıra bu kadar yakınsa sarı
 let schedule = null, selected = null;                    // son okunan çizelge ve seçili görev
 let live = { enabled: false, aircraft: [] };             // canlı THY konumları (OpenSky); plandan bağımsız katman
@@ -229,11 +246,14 @@ async function post(path, body) {
 }
 const sendMessage = () => post("/messages", $("message").value);
 const resetData = () => { selected = null; post("/admin/reset", ""); };
+const loadBigDay = () => { selected = null; post("/admin/reset?size=big", ""); };
+const armChaos = () => post("/admin/chaos", "");
+const sendStorm = () => { fill(DEMO_NOTAM); post("/messages", DEMO_NOTAM); };
 const resolve = () => post(`/jobs?change_penalty=${$("w-change").value}&standby_penalty=${$("w-standby").value}`, "");
 
 function drawAxis() {
   let html = "";
-  for (let m = DAY_START; m <= DAY_END; m += 120) html += `<span style="left:${pct(m)}%">${hhmm(m)}</span>`;
+  for (let m = DAY_START; m < DAY_END; m += 120) html += `<span style="left:${pct(m)}%">${hhmm(m)}</span>`;
   $("axis").innerHTML = html;
 }
 
@@ -263,6 +283,7 @@ function restHtml(active, minRest) {
 function drawGantt() {
   const { min_rest, max_duty } = schedule.rules;
   $("date").textContent = schedule.date;
+  $("gantt").classList.toggle("compact", schedule.crews.length > 12);
   $("gantt").innerHTML = schedule.crews.map(crew => {
     const mine = schedule.pairings.filter(p => p.crew === crew.id);
     const active = mine.filter(p => !isCancelled(p)).sort((a, b) => startOf(a) - startOf(b));
@@ -290,7 +311,8 @@ function drawMap() {
     const dest = p.legs[0].ades, a = airports[dest];
     const n = countTo[dest] = (countTo[dest] || 0) + 1;       // bu meydana giden kaçıncı görev
     const x2 = mapX(a.lon), y2 = mapY(a.lat);
-    const bend = 0.14 * Math.ceil(n / 2) * (n % 2 ? 1 : -1);   // 1., 2., 3. görev: sağa, sola, daha sağa
+    const fan = schedule.pairings.length > 40 ? 0.012 : 0.14;  // büyük günde yelpaze dar tutulur
+    const bend = fan * Math.ceil(n / 2) * (n % 2 ? 1 : -1);    // 1., 2., 3. görev: sağa, sola, daha sağa
     const cx = (x1 + x2) / 2 - (y2 - y1) * bend, cy = (y1 + y2) / 2 + (x2 - x1) * bend;
     const d = `M${x1},${y1} Q${cx},${cy} ${x2},${y2}`, state = stateOf(p);
     const shift = p.legs[0].std_min - p.legs[0].orig_std_min;
@@ -436,33 +458,49 @@ async function drawDetail() {
 }
 
 // Çözücü izi: amaç (turuncu) ve en iyi sınır (gri) her yeni çözümde nasıl yaklaştı? Aralarındaki fark gap'tir.
-function traceChart(trace) {
+function traceChart(trace, running) {
   if (!trace || trace.length < 2) return "";            // tek çözümde çizilecek bir eğri yok
-  const W = 320, H = 70, pad = 6;
+  const W = 560, H = 130, padL = 46, pad = 10;
   const values = trace.flatMap(p => [p.objective, p.bound]);
   const lo = Math.min(...values), hi = Math.max(...values, lo + 1);
-  // Yatay eksen çözüm sırası: küçük modelde bütün çözümler aynı milisaniyede bulunur
-  const x = i => pad + i / (trace.length - 1) * (W - 2 * pad), y = v => H - pad - (v - lo) / (hi - lo) * (H - 2 * pad);
-  const line = key => trace.map((p, i) => `${x(i)},${y(p[key])}`).join(" ");
-  const dots = (key, color) => trace.map((p, i) => `<circle cx="${x(i)}" cy="${y(p[key])}" r="2.5" fill="${color}"/>`).join("");
-  return `<h3>Çözücü ilerlemesi</h3><svg width="${W}" height="${H}" role="img" aria-label="amaç ve sınır">
-    <polyline points="${line("bound")}" fill="none" stroke="#6b7785" stroke-dasharray="4 3"/>${dots("bound", "#6b7785")}
-    <polyline points="${line("objective")}" fill="none" stroke="#d9480f" stroke-width="2"/>${dots("objective", "#d9480f")}
-  </svg><div class="muted" style="font-size:12px">— amaç: ${trace.map(p => p.objective).join(" → ")} &nbsp; ┄ en iyi sınır: ${trace.map(p => p.bound).join(" → ")}</div>`;
+  const tMax = trace[trace.length - 1].t;
+  // Uzun işte yatay eksen zamandır; anında biten işte bütün çözümler aynı milisaniyede olduğu için çözüm sırası
+  const byTime = tMax > 0.3;
+  const x = (p, i) => padL + (byTime ? p.t / tMax : i / (trace.length - 1)) * (W - padL - pad);
+  const y = v => H - pad - (v - lo) / (hi - lo) * (H - 2 * pad);
+  // Basamak çizgisi: yeni çözüm bulunana kadar değer sabit kalır
+  const steps = key => trace.map((p, i) => (i ? `${x(p, i)},${y(trace[i - 1][key])} ` : "") + `${x(p, i)},${y(p[key])}`).join(" ");
+  const last = trace[trace.length - 1];
+  const gap = last.objective ? ((last.objective - last.bound) / last.objective * 100).toFixed(1) : "0.0";
+  return `<h3>Çözücü ilerlemesi${running ? " (canlı)" : ""}</h3>
+  <svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px" role="img" aria-label="amaç ve en iyi sınır">
+    <text x="${padL - 6}" y="${y(hi) + 4}" text-anchor="end" font-size="10" fill="#6b7785">${hi}</text>
+    <text x="${padL - 6}" y="${y(lo) + 4}" text-anchor="end" font-size="10" fill="#6b7785">${lo}</text>
+    <line x1="${padL}" y1="${pad}" x2="${padL}" y2="${H - pad}" stroke="#dde3ea"/>
+    <polyline points="${steps("bound")}" fill="none" stroke="#6b7785" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <polyline points="${steps("objective")}" fill="none" stroke="#d9480f" stroke-width="2"/>
+    <circle cx="${x(last, trace.length - 1)}" cy="${y(last.objective)}" r="3.5" fill="#d9480f"/>
+  </svg>
+  <div class="muted" style="font-size:12px"><span style="color:#d9480f">—</span> amaç (bulunan en iyi çözüm): <b>${last.objective}</b>
+    &nbsp; ┄ en iyi sınır (bundan iyisi olamaz): <b>${last.bound}</b> &nbsp; gap: <b>${gap} %</b>
+    &nbsp; · ${trace.length} nokta${byTime ? ` · ${tMax.toFixed(1)} sn` : ""}</div>`;
 }
 
 function drawJob(job) {
   const num = v => v == null ? "–" : (Math.round(v * 1000) / 1000);
+  const running = ["queued", "running"].includes(job.status);
+  const elapsed = job.started_at ? Math.max(0, Math.round((Date.now() - new Date(job.started_at)) / 1000)) : 0;
   const w = { ...schedule.rules, ...(job.params || {}) };  // bu işte kullanılan ağırlıklar
   const n = (job.changes || []).length, s = job.standby_used ?? 0;
   const breakdown = job.objective == null ? "" :
     ` = ${n} değişiklik × ${w.change_penalty} + ${s} yedek × ${w.standby_penalty}`;
-  const broken = (job.violations || []).map(v => `<div class="note bad">${esc(v)}</div>`).join("");
-  const changes = (job.changes || []).map(c =>
-    `<div class="note"><b>${esc(c.pairing)}</b>: ${esc(c.from)} → ${esc(c.to)}<br><span class="muted">${esc(c.reason)}</span></div>`).join("");
+  const all = job.violations || [];
+  const broken = (all.length > 6 ? `<p><b>${all.length} kural ihlali.</b> İlk 6:</p>` : "")
+    + all.slice(0, 6).map(v => `<div class="note bad">${esc(v)}</div>`).join("");
   $("job").className = "";
   $("job").innerHTML = `
-    <p><span class="badge ${job.status}">${job.status}</span> <span class="mono">${esc(job.trigger)}</span></p>
+    <p><span class="badge ${job.status}">${job.status}</span> <span class="mono">${esc(job.trigger)}</span>
+       ${running ? ` · çalışıyor: <b>${elapsed} sn</b>` : ""}${job.attempts > 1 ? ` · <span class="no">${job.attempts}. deneme (önceki worker çöktü, iş devralındı)</span>` : ""}</p>
     <h3>1 · Mesajın bozduğu kurallar</h3>
     ${broken || `<p class="muted">Yok: mesajdan sonra da mevcut plan kurallara uyuyor.</p>`}
     <h3>2 · Çözücü</h3>
@@ -475,8 +513,10 @@ function drawJob(job) {
     </table>
     ${job.error ? `<div class="note bad">${esc(job.error)}</div>` : ""}
     <h3>3 · Karar</h3>
-    ${changes || `<p class="muted">${job.status === "succeeded" ? "Değişiklik yok: hiçbir ekip yerinden oynatılmadı." : "–"}</p>`}
-    ${traceChart(job.trace)}`;
+    ${n > 6 ? `<p><b>${n} görevin ekibi değişti</b>, ${s} yedek ekip devreye girdi. İlk 6 değişiklik:</p>` : ""}
+    ${(job.changes || []).slice(0, 6).map(c => `<div class="note"><b>${esc(c.pairing)}</b>: ${esc(c.from)} → ${esc(c.to)}<br><span class="muted">${esc(c.reason)}</span></div>`).join("")
+      || `<p class="muted">${job.status === "succeeded" ? "Değişiklik yok: hiçbir ekip yerinden oynatılmadı." : "–"}</p>`}
+    ${traceChart(job.trace, running)}`;
 }
 
 async function refresh() {
@@ -605,7 +645,7 @@ setInterval(refreshLive, 60000);
 drawAxis();
 setupMapGestures();
 refresh().then(() => { if (!localStorage.getItem("tourSeen")) startTour(); });
-setInterval(refresh, 2000);                              // iş durumu birkaç saniyede bir yenilenir
+setInterval(refresh, 1000);                              // iş durumu ve canlı çözücü izi saniyede bir yenilenir
 </script>
 </body>
 </html>

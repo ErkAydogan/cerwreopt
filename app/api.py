@@ -6,7 +6,7 @@ import logging
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,11 +14,11 @@ import segno
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
-from app import aftn, broker, config, db, live, logging_json, model, seed
+from app import aftn, broker, config, db, live, logging_json, model, notam, seed
 from app.airports import AIRPORTS
 from app.logging_json import log
 
@@ -82,6 +82,40 @@ def apply_message(conn: Connection, msg: aftn.AftnMessage, flight_id: int) -> No
         conn.execute(update(db.flights).where(db.flights.c.id == flight_id).values(status=status))
 
 
+def apply_closure(conn: Connection, closure: notam.Notam) -> int:
+    """Meydan kapanışını uçuş tablosuna işler; etkilenen bacak sayısını döndürür.
+    Kapalı aralıkta o meydandan kalkacak ya da oraya inecek her bacak açılış saatine ertelenir; erteleme aynı
+    görevin sonraki bacaklarına taşınır. Tekrar uygulanırsa aralıkta bacak kalmadığı için hiçbir şey değişmez."""
+    day = closure.start.date()
+    midnight = datetime.combine(day, datetime.min.time())
+    closed_from = int((closure.start - midnight).total_seconds() // 60)
+    closed_to = int((closure.end - midnight).total_seconds() // 60)
+    legs = conn.execute(
+        select(db.flights).where(db.flights.c.dof == day).order_by(db.flights.c.pairing_id, db.flights.c.leg_no)
+    ).all()
+    carried: dict[str, int] = {}  # görev -> önceki bacaklardan devreden gecikme (dk)
+    affected = 0
+    for leg in legs:
+        if leg.status == "CANCELLED":
+            continue
+        shift = carried.get(leg.pairing_id, 0)
+        std, sta = leg.std_min + shift, leg.sta_min + shift
+        hold = 0
+        if leg.adep == closure.aerodrome and closed_from <= std < closed_to:
+            hold = closed_to - std  # kalkış açılışa kadar bekler
+        elif leg.ades == closure.aerodrome and closed_from <= sta < closed_to:
+            hold = closed_to - sta  # iniş açılışa denk gelecek şekilde geç kalkar
+        shift += hold
+        carried[leg.pairing_id] = shift
+        if shift:
+            values = {"std_min": leg.std_min + shift, "sta_min": leg.sta_min + shift}
+            if hold:
+                values["status"] = "DELAYED"
+                affected += 1
+            conn.execute(update(db.flights).where(db.flights.c.id == leg.id).values(**values))
+    return affected
+
+
 def find_job(conn: Connection, key: str):
     return conn.execute(select(db.jobs.c.id, db.jobs.c.status).where(db.jobs.c.idempotency_key == key)).first()
 
@@ -130,6 +164,17 @@ def enqueue(job_id: str, status: str, duplicate: bool, publisher: broker.Publish
 @app.post("/messages", dependencies=[Depends(require_api_key)])
 async def post_message(request: Request, publisher: broker.Publisher = Depends(get_publisher)):
     raw = (await request.body()).decode("utf-8", errors="replace")
+    if notam.is_notam(raw):  # AFTN ağı NOTAM da taşır; meydan kapanışı birçok uçuşu birden etkiler
+        try:
+            closure = notam.parse(raw)
+        except notam.NotamParseError as exc:
+            return dead_letter(raw, str(exc))
+        ops_date = closure.start.date()
+        key = f"reopt:{ops_date.isoformat()}:{closure.body_hash()}"
+        job_id, status, duplicate = create_job_once(
+            key, ops_date, closure.summary(), before_insert=lambda conn: apply_closure(conn, closure)
+        )
+        return enqueue(job_id, status, duplicate, publisher)
     try:
         msg = aftn.parse(raw)
         with engine.connect() as conn:
@@ -171,10 +216,24 @@ def post_job(
 
 
 @app.post("/admin/reset", dependencies=[Depends(require_api_key)])
-def reset():
-    """Demo provası için: veriyi ilk haline döndürür."""
-    seed.load(engine)
-    return {"reset": True}
+def reset(size: str = "demo"):
+    """Demo provası için veriyi baştan yükler. size=demo: 14 görev; size=big: fırtına senaryosunun büyük günü."""
+    if size == "big":
+        crews, pairings = seed.big_day()
+        seed.load(engine, crews, pairings)
+    else:
+        seed.load(engine)
+    return {"reset": True, "size": size}
+
+
+@app.post("/admin/chaos", dependencies=[Depends(require_api_key)])
+def chaos():
+    """Çökme provası: worker, çalıştırdığı iş 2 saniyeyi geçince kendini aniden kapatır (bkz. worker.chaos_watchdog)."""
+    with engine.begin() as conn:
+        conn.execute(delete(db.flags).where(db.flags.c.name == "kill_worker"))
+        conn.execute(insert(db.flags).values(name="kill_worker", value="armed"))
+    log(logger, logging.WARNING, "chaos armed: worker will be killed during its next long job")
+    return {"armed": True}
 
 
 # --- Okuma uçları -------------------------------------------------------------------------------

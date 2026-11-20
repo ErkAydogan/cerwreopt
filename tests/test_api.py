@@ -147,3 +147,40 @@ def test_live_layer_is_off_by_default_and_parser_filters_thy():
 
 def test_live_endpoint_disabled_in_tests(client):
     assert client.get("/live/thy").json() == {"enabled": False, "aircraft": []}
+
+
+NOTAM = """GG LTFMYNYX
+230700 LTAAYNYX
+(A1234/26 NOTAMN
+Q) LTBB/QFALC/IV/NBO/A/000/999/4116N02844E005
+A) LTFM B) 2611230900 C) 2611231100
+E) AD CLSD DUE TO HEAVY SNOW)"""
+
+
+def test_notam_closure_holds_departures_and_arrivals_until_reopening(client, engine, publisher):
+    r = client.post("/messages", content=NOTAM)
+    assert r.status_code == 202 and len(publisher.published) == 1
+    # P04: 09:45 kalkış kapalı aralıkta -> 11:00'e ertelenir (75 dk), dönüş bacağı da 75 dk kayar
+    assert legs_of(engine, "P04") == [(660, 750, "DELAYED"), (810, 900, "SCHEDULED")]
+    # P06: dönüşü 09:10'da İstanbul'a inecekti -> iniş 11:00'e denk gelecek şekilde 110 dk geç kalkar
+    assert legs_of(engine, "P06") == [(360, 425, "SCHEDULED"), (595, 660, "DELAYED")]
+    # P03: 08:40'ta inmişti, aralığın dışında -> dokunulmaz
+    assert legs_of(engine, "P03") == [(330, 395, "SCHEDULED"), (455, 520, "SCHEDULED")]
+    # Aynı NOTAM yeniden gelirse tek iş, gecikme iki kez uygulanmaz
+    again = client.post("/messages", content=NOTAM).json()
+    assert again["duplicate"] is True and count(engine, db.jobs) == 1
+    assert legs_of(engine, "P04")[0][0] == 660
+
+
+def test_unsupported_notam_is_dead_lettered(client, engine):
+    r = client.post("/messages", content=NOTAM.replace("QFALC", "QMRLC"))
+    assert r.status_code == 422 and "unsupported Q-code" in r.json()["error"]
+    assert count(engine, db.dead_letters) == 1
+
+
+def test_big_day_loads_a_valid_plan_and_chaos_flag_is_armed(client, engine):
+    assert client.post("/admin/reset", params={"size": "big"}).json() == {"reset": True, "size": "big"}
+    schedule = client.get("/schedule").json()
+    assert len(schedule["pairings"]) == 150 and sum(c["is_standby"] for c in schedule["crews"]) == 25
+    assert client.post("/admin/chaos").json() == {"armed": True}
+    assert count(engine, db.flags) == 1

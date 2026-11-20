@@ -42,6 +42,7 @@ def test_delay_breaks_rest_and_one_change_fixes_it():
     assert result.objective == 130
     assert result.gap == 0
     assert result.trace and result.trace[-1]["objective"] == 130  # çözücü ilerlemesi kaydedildi
+    assert result.trace[-1]["bound"] == 130  # son nokta: amaç ile sınır buluştu
 
 
 def test_cancelled_pairing_is_not_assigned():

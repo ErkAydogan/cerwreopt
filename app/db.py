@@ -102,6 +102,15 @@ dead_letters = Table(
 )
 
 
+# Demo için kumanda bayrakları (ör. çökme provası): API yazar, worker okur
+flags = Table(
+    "flags",
+    metadata,
+    Column("name", String(32), primary_key=True),
+    Column("value", String(64), nullable=False),
+)
+
+
 def make_engine(url: str) -> Engine:
     # pool_pre_ping: veritabanı yeniden başladıysa ölü bağlantıyı kullanmadan önce fark et
     return create_engine(url, pool_pre_ping=True)

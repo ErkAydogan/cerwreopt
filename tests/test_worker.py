@@ -111,3 +111,12 @@ def test_what_if_weights_change_the_decision(client, engine):
     job = job_row(engine, job_id)
     assert job.objective == 100 and job.standby_used == 0
     assert crew_of(engine, "P02") == "C3"
+
+
+def test_big_day_plan_breaks_no_rule_before_the_storm(client, engine):
+    from app import config, model
+
+    client.post("/admin/reset", params={"size": "big"})
+    with engine.connect() as conn:
+        pairings = db.load_pairings(conn, api.settings.ops_date)
+    assert model.violations(pairings, config.rules(api.settings)) == []

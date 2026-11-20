@@ -1,0 +1,268 @@
+# HTTP katmanı (FastAPI): AFTN mesajı alır, uçuş tablosunu günceller, yeniden planlama işini kuyruğa koyar.
+# Çözücüyü burada ÇALIŞTIRMAZ: iş satırını yazar, job_id yayınlar, hemen 202 döner; işi worker yapar.
+# Yazma uçları X-API-Key ister; GET uçları açıktır.
+import io
+import logging
+import secrets
+from contextlib import asynccontextmanager
+from datetime import date
+from pathlib import Path
+from uuid import uuid4
+
+import segno
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
+from sqlalchemy import insert, select, text, update
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
+
+from app import aftn, broker, config, db, logging_json, seed
+from app.logging_json import log
+
+settings = config.load()
+logging_json.setup(settings.log_level)
+logger = logging.getLogger("api")
+engine = db.make_engine(settings.database_url)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init_db(engine)
+    yield
+
+
+app = FastAPI(title="crewreopt", lifespan=lifespan)
+
+
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    # compare_digest: karşılaştırma süresi anahtarın ne kadarının tuttuğunu sızdırmaz
+    if not secrets.compare_digest(x_api_key or "", settings.api_key):
+        raise HTTPException(status_code=401, detail="missing or invalid X-API-Key")
+
+
+def get_publisher() -> broker.Publisher:
+    return broker.Publisher(settings.rabbitmq_url)  # testlerde sahte yayıncıyla değiştirilir
+
+
+# --- Yardımcılar --------------------------------------------------------------------------------
+
+
+def dead_letter(raw: str, error: str) -> JSONResponse:
+    """Okunamayan mesaj kaybolmaz: ham metin + neden saklanır, gönderen 422 alır."""
+    with engine.begin() as conn:
+        conn.execute(insert(db.dead_letters).values(raw=raw, error=error))
+    log(logger, logging.WARNING, "message dead-lettered", error=error)
+    return JSONResponse(status_code=422, content={"error": error, "dead_lettered": True})
+
+
+def apply_message(conn: Connection, msg: aftn.AftnMessage, flight_id: int) -> None:
+    """Mesajı uçuş tablosuna işler. Dört tip de tekrar uygulanınca aynı sonucu verir (idempotent):
+    DLA mutlak saat taşır, yani ikinci uygulamada kaydırma 0 çıkar."""
+    leg = conn.execute(select(db.flights).where(db.flights.c.id == flight_id)).one()
+    same_pairing = db.flights.c.pairing_id == leg.pairing_id
+    if msg.msg_type == "DLA":
+        delta = msg.minutes - leg.std_min
+        # Gecikme sonraki bacaklara aynen yansır (yerde kalış süresi sabit varsayımı)
+        conn.execute(
+            update(db.flights)
+            .where(same_pairing, db.flights.c.leg_no >= leg.leg_no)
+            .values(std_min=db.flights.c.std_min + delta, sta_min=db.flights.c.sta_min + delta)
+        )
+        conn.execute(update(db.flights).where(db.flights.c.id == flight_id).values(status="DELAYED"))
+    elif msg.msg_type == "CNL":
+        # Bir bacak iptalse gidiş-dönüş görevin tamamı iptaldir
+        conn.execute(update(db.flights).where(same_pairing).values(status="CANCELLED"))
+    else:
+        status = {"DEP": "DEPARTED", "ARR": "ARRIVED"}[msg.msg_type]
+        conn.execute(update(db.flights).where(db.flights.c.id == flight_id).values(status=status))
+
+
+def find_job(conn: Connection, key: str):
+    return conn.execute(select(db.jobs.c.id, db.jobs.c.status).where(db.jobs.c.idempotency_key == key)).first()
+
+
+def create_job_once(key: str, ops_date: date, trigger: str, before_insert=None) -> tuple[str, str, bool]:
+    """İşi en fazla bir kez oluşturur; (job_id, status, duplicate) döner.
+    Önce anahtara bakar; yarış durumunda son sözü unique constraint söyler."""
+    try:
+        with engine.begin() as conn:  # tek transaction: uçuş güncellemesi + iş satırı ya birlikte ya hiç
+            existing = find_job(conn, key)
+            if existing:
+                return existing.id, existing.status, True
+            if before_insert:
+                before_insert(conn)
+            job_id = str(uuid4())
+            conn.execute(
+                insert(db.jobs).values(
+                    id=job_id, idempotency_key=key, ops_date=ops_date, trigger=trigger, status="queued"
+                )
+            )
+            return job_id, "queued", False
+    except IntegrityError:
+        # Aynı mesaj aynı anda iki istekle geldi; diğeri kazandı. Onun işini döndür.
+        with engine.connect() as conn:
+            existing = find_job(conn, key)
+        return existing.id, existing.status, True
+
+
+def enqueue(job_id: str, status: str, duplicate: bool, publisher: broker.Publisher) -> JSONResponse:
+    """İş hâlâ 'queued' ise yayınla. Yinelenen istekte de yayınlarız: ilk yayın başarısız olmuş olabilir;
+    mesaj iki kez giderse worker'daki atomik queued->running geçişi ikincisini eler."""
+    if status == "queued":
+        try:
+            publisher.publish(job_id)
+        except Exception as exc:
+            log(logger, logging.ERROR, "publish failed, job stays queued", job_id=job_id, error=str(exc))
+            detail = {"job_id": job_id, "error": "queue unavailable; job is saved, resend to retry"}
+            raise HTTPException(status_code=503, detail=detail) from exc
+    log(logger, logging.INFO, "job accepted", job_id=job_id, duplicate=duplicate, status=status)
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": status, "duplicate": duplicate})
+
+
+# --- Yazma uçları -------------------------------------------------------------------------------
+
+
+@app.post("/messages", dependencies=[Depends(require_api_key)])
+async def post_message(request: Request, publisher: broker.Publisher = Depends(get_publisher)):
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    try:
+        msg = aftn.parse(raw)
+        with engine.connect() as conn:
+            flight_id = aftn.resolve_flight(msg, db.flight_index(conn, msg.dof))
+    except (aftn.AftnParseError, aftn.UnknownFlightError) as exc:
+        return dead_letter(raw, str(exc))
+
+    if not msg.triggers_replan:  # DEP / ARR: sadece durum güncellenir
+        with engine.begin() as conn:
+            apply_message(conn, msg, flight_id)
+        log(logger, logging.INFO, "flight status updated", type=msg.msg_type, callsign=msg.callsign)
+        return {"type": msg.msg_type, "callsign": msg.callsign, "job_id": None}
+
+    # Anahtar başlıktan değil gövdeden: aynı mesaj yeniden iletilirse ikinci iş oluşmaz
+    key = f"reopt:{msg.dof.isoformat()}:{msg.body_hash()}"
+    job_id, status, duplicate = create_job_once(
+        key, msg.dof, msg.body, before_insert=lambda conn: apply_message(conn, msg, flight_id)
+    )
+    return enqueue(job_id, status, duplicate, publisher)
+
+
+@app.post("/jobs", dependencies=[Depends(require_api_key)])
+def post_job(
+    ops_date: date | None = None,
+    idempotency_key: str | None = Header(default=None),
+    publisher: broker.Publisher = Depends(get_publisher),
+):
+    """Elle yeniden planlama. İstemci Idempotency-Key gönderirse tekrar denemeler aynı işi döndürür."""
+    ops_date = ops_date or settings.ops_date
+    key = f"reopt:{ops_date.isoformat()}:manual:{idempotency_key or uuid4()}"
+    job_id, status, duplicate = create_job_once(key, ops_date, "manual")
+    return enqueue(job_id, status, duplicate, publisher)
+
+
+@app.post("/admin/reset", dependencies=[Depends(require_api_key)])
+def reset():
+    """Demo provası için: veriyi ilk haline döndürür."""
+    seed.load(engine)
+    return {"reset": True}
+
+
+# --- Okuma uçları -------------------------------------------------------------------------------
+
+JOB_FIELDS = [c for c in db.jobs.c if c.name != "input_snapshot"]  # anlık görüntü büyük; ayrı uçtan verilir
+
+
+@app.get("/jobs")
+def list_jobs(limit: int = 10):
+    with engine.connect() as conn:
+        rows = conn.execute(select(*JOB_FIELDS).order_by(db.jobs.c.created_at.desc()).limit(limit))
+        return [dict(r._mapping) for r in rows]
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    with engine.connect() as conn:
+        row = conn.execute(select(*JOB_FIELDS).where(db.jobs.c.id == job_id)).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return dict(row._mapping)
+
+
+@app.get("/jobs/{job_id}/input")
+def get_job_input(job_id: str):
+    """Modele verilen girdinin aynısı. 'Dün model neden bunu önerdi?' sorusu bununla yeniden üretilir."""
+    with engine.connect() as conn:
+        row = conn.execute(select(db.jobs.c.input_snapshot).where(db.jobs.c.id == job_id)).first()
+    if row is None or row.input_snapshot is None:
+        raise HTTPException(status_code=404, detail="no input snapshot (job not started yet?)")
+    return row.input_snapshot
+
+
+@app.get("/schedule")
+def get_schedule(ops_date: date | None = None):
+    ops_date = ops_date or settings.ops_date
+    with engine.connect() as conn:
+        crew_rows = conn.execute(select(db.crews).order_by(db.crews.c.is_standby, db.crews.c.id)).all()
+        assigned = {r.pairing_id: r for r in conn.execute(select(db.assignments))}
+        legs = conn.execute(
+            select(db.flights)
+            .where(db.flights.c.dof == ops_date)
+            .order_by(db.flights.c.pairing_id, db.flights.c.leg_no)
+        ).all()
+    pairings: dict[str, dict] = {}
+    for leg in legs:
+        a = assigned.get(leg.pairing_id)
+        p = pairings.setdefault(
+            leg.pairing_id,
+            {
+                "id": leg.pairing_id,
+                "crew": a.crew_id if a else None,
+                "previous_crew": a.previous_crew_id if a else None,
+                "changed_by_job": a.changed_by_job if a else None,
+                "legs": [],
+            },
+        )
+        p["legs"].append(
+            {
+                "callsign": leg.callsign, "adep": leg.adep, "ades": leg.ades, "status": leg.status,
+                "std_min": leg.std_min, "sta_min": leg.sta_min, "orig_std_min": leg.orig_std_min,
+            }
+        )
+    return {
+        "date": ops_date.isoformat(),
+        "rules": {"min_rest": settings.min_rest, "max_duty": settings.max_duty},
+        "crews": [{"id": c.id, "is_standby": c.is_standby} for c in crew_rows],
+        "pairings": list(pairings.values()),
+    }
+
+
+@app.get("/health")
+def health(publisher: broker.Publisher = Depends(get_publisher)):
+    checks = {}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+    try:
+        publisher.ping()
+        checks["rabbitmq"] = "ok"
+    except Exception as exc:
+        checks["rabbitmq"] = f"error: {exc}"
+    healthy = all(v == "ok" for v in checks.values())
+    return JSONResponse(status_code=200 if healthy else 503, content={**checks, "git_sha": settings.git_sha})
+
+
+@app.get("/qr.svg", include_in_schema=False)
+def qr():
+    """Demonun genel adresini QR olarak verir: izleyen kişi telefonundan açıp kendisi deneyebilir."""
+    if not settings.public_url:
+        raise HTTPException(status_code=404, detail="PUBLIC_URL not set")
+    buffer = io.BytesIO()
+    segno.make(settings.public_url).save(buffer, kind="svg", scale=4, border=2)
+    return Response(content=buffer.getvalue(), media_type="image/svg+xml")
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(Path(__file__).parent / "static" / "index.html")

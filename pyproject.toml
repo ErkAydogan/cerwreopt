@@ -1,0 +1,15 @@
+# Araç ayarları: pytest proje kökünden import etsin, ruff tek yerden yapılandırılsın.
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI bağımlılıkları argüman varsayılanı olarak yazılır; bu bir hata değil, çerçevenin kullanım biçimi
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header"]

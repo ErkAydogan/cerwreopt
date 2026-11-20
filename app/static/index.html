@@ -59,6 +59,31 @@
   tr.current td { background:#f1f5fb; }
   .weights { display:grid; grid-template-columns:1fr 1fr; gap:8px; } .weights label { font-size:12px; color:var(--muted); }
   #response { margin-top:8px; white-space:pre-wrap; }
+  /* Harita: İstanbul'dan çıkan rotalar; renk uçuşun durumunu gösterir */
+  .mapgrid { display:grid; grid-template-columns:minmax(0, 1.5fr) minmax(0, 1fr); gap:20px; align-items:center; }
+  .mapbox { position:relative; }
+  #map { width:100%; height:auto; max-height:380px; background:#eaf1f8; border-radius:6px; cursor:grab; touch-action:none; display:block; }
+  #map.dragging { cursor:grabbing; }
+  .zoom { position:absolute; top:8px; left:8px; display:flex; flex-direction:column; gap:4px; }
+  .zoom button { margin:0; width:30px; height:30px; padding:0; font-size:16px; line-height:1; }
+  #map .land { fill:#fbfcfd; stroke:#c5ced8; stroke-width:.6; }
+  #map path, #map circle { vector-effect:non-scaling-stroke; }   /* yakınlaşınca çizgiler kalınlaşmasın */
+  .route { fill:none; stroke:var(--leg); stroke-width:1.6; opacity:.55; }
+  .route.delayed { stroke:var(--warn); stroke-width:2.8; opacity:1; }
+  .route.changed { stroke:var(--changed); stroke-width:2.8; opacity:1; }
+  .route.cancelled { stroke:var(--cancelled); stroke-dasharray:5 4; opacity:1; }
+  .route.selected { stroke:var(--ink); stroke-width:3.6; opacity:1; }
+  .hit { fill:none; stroke:transparent; stroke-width:14; cursor:pointer; }   /* ince çizgiye tıklamak kolay olsun */
+  .plane { fill:#b3261e; stroke:#fff; stroke-width:.6; pointer-events:none; }   /* canlı THY uçağı */
+  .plane.selected { fill:var(--ink); stroke:#ffd43b; stroke-width:1.5; }
+  .planehit { fill:transparent; cursor:pointer; }
+  #plane-info { border:1px solid var(--line); border-left:3px solid #b3261e; border-radius:6px; padding:8px 10px; margin-top:10px; }
+  #map text { fill:var(--ink); paint-order:stroke; stroke:#fff; stroke-width:2.5px; }
+  .tiles { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .tile { border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  .tile b { display:block; font-size:22px; line-height:1.2; } .tile span { font-size:12px; color:var(--muted); }
+  .tile.alert b { color:var(--changed); }
+  @media (max-width: 800px) { .mapgrid { grid-template-columns:1fr; } }
   /* Tanıtım turu: hedef kart öne çıkar, geri kalan kararır; açıklama kutusu altta sabit durur */
   .spot { position:relative; z-index:50; box-shadow:0 0 0 4px var(--changed), 0 0 0 9999px rgba(15,23,32,.55); scroll-margin-top:16px; }
   #tour { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); width:min(600px, 94vw); z-index:100;
@@ -85,6 +110,31 @@
 </header>
 <main>
   <section>
+    <div class="card" id="card-map">
+      <h2>Bugünkü uçuşlar</h2>
+      <div class="mapgrid">
+        <div class="mapbox">
+          <svg id="map" role="img" aria-label="İstanbul çıkışlı rotalar"></svg>
+          <div class="zoom">
+            <button onclick="zoomBy(1.6)" title="Yakınlaş">+</button>
+            <button onclick="zoomBy(1 / 1.6)" title="Uzaklaş">−</button>
+            <button onclick="resetView()" title="Tümünü göster">⟲</button>
+          </div>
+        </div>
+        <div>
+          <div class="tiles" id="tiles"></div>
+          <p class="legend">
+            <span><i style="background:var(--leg)"></i>zamanında</span>
+            <span><i style="background:var(--warn)"></i>gecikti</span>
+            <span><i style="background:var(--changed)"></i>ekibi değişti</span>
+            <span><i style="background:var(--cancelled)"></i>iptal</span>
+          </p>
+          <p class="hint" style="margin-top:8px">Bir rotaya tıklayın: o görevin detayı aşağıda açılır. Tekerlekle yakınlaşın, sürükleyerek kaydırın.</p>
+          <p class="hint" id="live-note" hidden></p>
+          <div id="plane-info" hidden></div>
+        </div>
+      </div>
+    </div>
     <div class="card" id="card-gantt">
       <h2>Ekip çizelgesi</h2>
       <p class="hint">Bir göreve tıklayın: kimin uçabileceğini ve neden uçamayacağını görün. Bloklar arasındaki sayılar dinlenme süresidir (dk).</p>
@@ -150,12 +200,17 @@
   <button onclick="endTour()" style="float:right">Kapat</button>
 </div>
 
+<script src="/static/map.js"></script>  <!-- harita altlığı: scripts/build_map.py üretir -->
 <script>
 const DEMO_DLA = "FF LTFMZPZX\n231200 EDDFZQZX\n(DLA-THY1591-LTFM0830-EDDF-DOF/261123)";
 const DEMO_CNL = "FF LTFMZPZX\n231210 LTAIZPZX\n(CNL-THY2412-LTFM1500-LTAI-DOF/261123)";
 const DAY_START = 4 * 60, DAY_END = 22 * 60;            // çizelgede gösterilen aralık (dakika)
 const TIGHT_MARGIN = 15;                                 // dinlenme sınıra bu kadar yakınsa sarı
 let schedule = null, selected = null;                    // son okunan çizelge ve seçili görev
+let live = { enabled: false, aircraft: [] };             // canlı THY konumları (OpenSky); plandan bağımsız katman
+let selectedPlane = null;                                // tıklanan canlı uçağın ICAO24 adresi
+let view = null;                                         // haritanın görünen penceresi {x, y, w, h}; null = tamamı
+let dragMoved = false;                                   // sürükleme bittiğinde tıklama sayılmasın
 
 const $ = id => document.getElementById(id);
 const pct = min => (min - DAY_START) / (DAY_END - DAY_START) * 100;
@@ -220,9 +275,138 @@ function drawGantt() {
   }).join("");
 }
 
+// Harita: her görev İstanbul'dan varış meydanına bir yay. Aynı meydana giden görevler farklı eğrilikte çizilir.
+const mapX = lon => (lon - MAP.lon0) * MAP.kx, mapY = lat => (MAP.lat1 - lat) * MAP.ky;
+const stateOf = p => isCancelled(p) ? "cancelled" : p.changed_by_job ? "changed"
+  : p.legs.some(l => l.std_min !== l.orig_std_min) ? "delayed" : "";
+
+function drawMap() {
+  view = view || { x: 0, y: 0, w: MAP.width, h: MAP.height };
+  const k = view.w / MAP.width;                              // yakınlaştıkça işaretler aynı boyda kalsın diye ölçek
+  const airports = schedule.airports, hub = airports.LTFM;
+  const x1 = mapX(hub.lon), y1 = mapY(hub.lat), countTo = {};
+  let routes = "", labels = "";
+  for (const p of schedule.pairings) {
+    const dest = p.legs[0].ades, a = airports[dest];
+    const n = countTo[dest] = (countTo[dest] || 0) + 1;       // bu meydana giden kaçıncı görev
+    const x2 = mapX(a.lon), y2 = mapY(a.lat);
+    const bend = 0.14 * Math.ceil(n / 2) * (n % 2 ? 1 : -1);   // 1., 2., 3. görev: sağa, sola, daha sağa
+    const cx = (x1 + x2) / 2 - (y2 - y1) * bend, cy = (y1 + y2) / 2 + (x2 - x1) * bend;
+    const d = `M${x1},${y1} Q${cx},${cy} ${x2},${y2}`, state = stateOf(p);
+    const shift = p.legs[0].std_min - p.legs[0].orig_std_min;
+    const title = `${p.id} · ${p.legs.map(l => l.callsign).join(" / ")} · ${a.name} · ekip ${p.crew}`;
+    routes += `<path class="route ${state} ${p.id === selected ? "selected" : ""}" d="${d}"/>`
+      + `<path class="hit" d="${d}" onclick="if (!dragMoved) select('${p.id}')"><title>${esc(title)}</title></path>`;
+    if (shift) labels += `<text x="${(x1 + 2 * cx + x2) / 4}" y="${(y1 + 2 * cy + y2) / 4 - 4 * k}" font-size="${10 * k}" text-anchor="middle" font-weight="700">+${shift}′</text>`;
+  }
+  const used = new Set(schedule.pairings.flatMap(p => p.legs.map(l => l.ades)));
+  const dots = Object.entries(airports).filter(([icao]) => used.has(icao)).map(([icao, a]) => {
+    const isHub = icao === "LTFM";
+    return `<circle cx="${mapX(a.lon)}" cy="${mapY(a.lat)}" r="${(isHub ? 5 : 3) * k}" fill="${isHub ? "var(--ink)" : "var(--leg)"}"/>`
+      + `<text x="${mapX(a.lon) + 6 * k}" y="${mapY(a.lat) + 3 * k}" font-size="${10 * k}" ${isHub ? 'font-weight="700"' : ""}>${a.name}</text>`;
+  }).join("");
+  // Canlı katman: her uçak, rota açısına göre döndürülmüş küçük bir ok
+  // (rotaların üstünde çizilir ki tıklanabilsin; görünmez daire tıklama alanını büyütür)
+  const planes = live.aircraft.map(a => {
+    const now = estimatePosition(a);
+    const x = mapX(now.lon).toFixed(1), y = mapY(now.lat).toFixed(1), sel = a.icao24 === selectedPlane;
+    return `<path class="plane ${sel ? "selected" : ""}" d="M0,-5 L3.2,4 L0,2 L-3.2,4 Z" transform="translate(${x},${y}) rotate(${Math.round(a.heading)}) scale(${k * (sel ? 1.8 : 1)})"/>`
+      + `<circle class="planehit" cx="${x}" cy="${y}" r="${7 * k}" onclick="if (!dragMoved) selectPlane('${a.icao24}')"><title>${esc(a.callsign)}</title></circle>`;
+  }).join("");
+  $("map").setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+  $("map").innerHTML = `<path class="land" d="${MAP.land}"/>${routes}${dots}${labels}${planes}`;
+  drawPlaneInfo();
+}
+
+// Veri 15 dakikada bir çekilir. Arada uçak donmuş görünmesin diye son bilinen hız ve yönle ilerletilir
+// (düz uçuş varsayımı; dönüş ya da iniş bilinemez, o yüzden arayüzde "tahmini" yazar).
+const liveAgeSeconds = () => Math.min(20 * 60, (live.age_s || 0) + (Date.now() - (live.receivedAt || Date.now())) / 1000);
+function estimatePosition(a) {
+  const meters = (a.speed_ms || 0) * liveAgeSeconds(), heading = a.heading * Math.PI / 180;
+  const lat = a.lat + meters * Math.cos(heading) / 111320;                          // 1 derece enlem ~ 111 km
+  const lon = a.lon + meters * Math.sin(heading) / (111320 * Math.cos(a.lat * Math.PI / 180));
+  return { lat, lon };
+}
+
+// Canlı uçak bilgisi: OpenSky'dan gelen gerçek değerler (plan verisiyle ilgisi yok)
+function selectPlane(icao24) { selectedPlane = selectedPlane === icao24 ? null : icao24; drawMap(); }
+function drawPlaneInfo() {
+  const a = live.aircraft.find(p => p.icao24 === selectedPlane);
+  $("plane-info").hidden = !a;
+  if (!a) return;
+  const feet = a.altitude_m == null ? "–" : Math.round(a.altitude_m * 3.281 / 100) * 100 + " ft";
+  const knots = a.speed_ms == null ? "–" : Math.round(a.speed_ms * 1.944) + " kt";
+  const trend = a.vertical_ms == null || Math.abs(a.vertical_ms) < 1 ? "düz uçuş" : a.vertical_ms > 0 ? "tırmanıyor" : "alçalıyor";
+  $("plane-info").innerHTML = `<b>${esc(a.callsign)}</b> <span class="muted">· canlı · ICAO24 ${esc(a.icao24)}</span><br>
+    ${feet} · ${knots} · rota ${Math.round(a.heading)}° · ${trend}<br>
+    <span class="muted">son ölçüm ${a.lat.toFixed(2)}°K ${a.lon.toFixed(2)}°D, ${Math.round(liveAgeSeconds() / 60)} dk önce · tescil: ${esc(a.country || "–")}</span>`;
+}
+
+// Yakınlaştırma: SVG'nin viewBox'ı küçültülür. cx, cy: sabit kalacak nokta (harita biriminde).
+function zoomAt(factor, cx, cy) {
+  const w = Math.min(MAP.width, Math.max(MAP.width / 16, view.w / factor)), h = w * MAP.height / MAP.width;
+  view = { x: cx - (cx - view.x) * w / view.w, y: cy - (cy - view.y) * h / view.h, w, h };
+  clampView();
+  drawMap();
+}
+function clampView() {                                     // harita dışına kaydırılmasın
+  view.x = Math.min(Math.max(view.x, 0), MAP.width - view.w);
+  view.y = Math.min(Math.max(view.y, 0), MAP.height - view.h);
+}
+const zoomBy = factor => zoomAt(factor, view.x + view.w / 2, view.y + view.h / 2);
+const resetView = () => { view = null; drawMap(); };
+
+function setupMapGestures() {
+  const svg = $("map");
+  const unit = () => view.w / svg.getBoundingClientRect().width;   // 1 ekran pikseli kaç harita birimi
+  svg.addEventListener("wheel", e => {
+    e.preventDefault();                                            // sayfa kaymasın, harita yakınlaşsın
+    if (!view) return;
+    const box = svg.getBoundingClientRect();
+    zoomAt(e.deltaY < 0 ? 1.25 : 0.8, view.x + (e.clientX - box.left) * unit(), view.y + (e.clientY - box.top) * unit());
+  }, { passive: false });
+  let last = null;
+  svg.addEventListener("pointerdown", e => { last = { x: e.clientX, y: e.clientY }; dragMoved = false; });
+  window.addEventListener("pointermove", e => {
+    if (!last || !view) return;
+    const dx = e.clientX - last.x, dy = e.clientY - last.y;
+    if (!dragMoved && Math.abs(dx) + Math.abs(dy) < 4) return;     // küçük titreme tıklama sayılır
+    dragMoved = true;
+    svg.classList.add("dragging");
+    view.x -= dx * unit(); view.y -= dy * unit();
+    last = { x: e.clientX, y: e.clientY };
+    clampView();
+    svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+  });
+  window.addEventListener("pointerup", () => { last = null; svg.classList.remove("dragging"); setTimeout(() => dragMoved = false, 0); });
+}
+
+// Günün özeti: sayılar çizelgeden hesaplanır
+function drawTiles() {
+  const P = schedule.pairings, legs = P.flatMap(p => p.legs);
+  const active = P.filter(p => !isCancelled(p));
+  const standby = new Set(schedule.crews.filter(c => c.is_standby).map(c => c.id));
+  let tightest = Infinity;                                   // tüm ekiplerde en kısa dinlenme
+  for (const crew of schedule.crews) {
+    const mine = active.filter(p => p.crew === crew.id).sort((a, b) => startOf(a) - startOf(b));
+    for (let i = 1; i < mine.length; i++) tightest = Math.min(tightest, startOf(mine[i]) - endOf(mine[i - 1]));
+  }
+  const tiles = [
+    [legs.length, "uçuş", false],
+    [legs.filter(l => l.status !== "CANCELLED" && l.std_min !== l.orig_std_min).length, "geciken uçuş", true],
+    [legs.filter(l => l.status === "CANCELLED").length, "iptal uçuş", true],
+    [P.filter(p => p.changed_by_job && !isCancelled(p)).length, "ekibi değişen görev", true],
+    [new Set(active.filter(p => standby.has(p.crew)).map(p => p.crew)).size + " / " + standby.size, "kullanılan yedek", false],
+    [tightest === Infinity ? "–" : tightest + " dk", "en kısa dinlenme (kural ≥ " + schedule.rules.min_rest + ")", false],
+  ];
+  $("tiles").innerHTML = tiles.map(([value, label, alert]) =>
+    `<div class="tile ${alert && value ? "alert" : ""}"><b>${value}</b><span>${label}</span></div>`).join("");
+}
+
 // Görev detayı: bacaklar + "bu görevi kim uçabilir?" (sunucudaki model.why_not kurallarıyla)
 function select(pairingId) {
   selected = pairingId;
+  drawMap();
   drawGantt();
   drawDetail().then(() => $("detail-card").scrollIntoView({ behavior: "smooth", block: "nearest" }));
 }
@@ -300,6 +484,8 @@ async function refresh() {
     const [sched, jobs, health] = await Promise.all(
       ["/schedule", "/jobs", "/health"].map(u => fetch(u).then(r => r.json())));
     schedule = sched;
+    drawMap();
+    drawTiles();
     drawGantt();
     drawDetail();
     $("health").textContent = `db ${health.db} · mq ${health.rabbitmq} · ${health.git_sha}`;
@@ -327,8 +513,11 @@ const TOUR = [
            <p>Bir uçuş gecikirse ekip sonraki uçuşuna yetişemeyebilir. Bu sistem gecikme mesajını alır,
            hangi kuralın bozulduğunu bulur ve planı <b>en az değişiklikle</b> onarır.</p>
            <p class="muted">Tur yaklaşık 1 dakika sürer ve örnek bir gecikmeyi sizin yerinize oynatır.</p>` },
-  { target: "#card-gantt", title: "Günün planı",
+  { target: "#card-map", title: "Bugünkü uçuşlar",
     before: async () => { selected = null; await post("/admin/reset", ""); },
+    text: `<p>İstanbul'dan çıkıp aynı gün geri dönen 14 gidiş-dönüş uçuş. Her yay bir gidiş-dönüş.</p>
+           <p>Sağdaki kutular günün özetini verir. Bir uçuş gecikince ya da iptal olunca rota renk değiştirir.</p>` },
+  { target: "#card-gantt", title: "Günün planı",
     text: `<p>Her satır bir <b>ekip</b>, her mavi blok bir <b>uçuş</b>. C1–C5 normal ekipler, S1–S2 evde bekleyen <b>yedek</b> ekipler.</p>
            <p>Bloklar arasındaki sayı <b>dinlenme süresi</b>: kural en az 60 dakika. Soldaki çubuk ekibin günlük
            <b>görev süresi</b>: en çok 780 dakika (13 saat).</p>` },
@@ -348,7 +537,7 @@ const TOUR = [
            Amaç 130 = bir uçuşun ekibi değişti (100) + bir yedek kullanıldı (30).</p>
            <p><b>3 · Karar:</b> hangi uçuş kimden kime geçti ve neden.</p>` },
   { target: "#detail-card", title: "Neden başka bir ekip değil?",
-    before: async () => { selected = "P02"; drawGantt(); await drawDetail(); },
+    before: async () => { selected = "P02"; drawMap(); drawGantt(); await drawDetail(); },
     text: `<p>Çizelgede bir uçuşa tıklayınca bu tablo açılır. Atina uçuşu için her ekibe bakılmış:
            normal ekiplerin hepsi o saatte dolu ya da dinlenmesi yetmiyor; sadece yedekler uygun.</p>
            <p class="muted">Operasyon sorumlusu "neden C4 değil?" diye sorduğunda cevap burada.</p>` },
@@ -397,7 +586,24 @@ function endTour() {
   localStorage.setItem("tourSeen", "1");                      // bir kez görüldü; "Tur" düğmesiyle yeniden açılır
 }
 
+// Sunucuya dakikada bir sorulur; sunucu dış servise ancak 15 dakikada bir gider (önbellek)
+async function refreshLive() {
+  try {
+    live = await fetch("/live/thy").then(r => r.json());
+    live.receivedAt = Date.now();
+    if (!live.enabled) return;
+    $("live-note").hidden = false;
+    $("live-note").innerHTML = `<span style="color:#b3261e">▲</span> Havada <b>${live.aircraft.length}</b> THY uçağı `
+      + `(gerçek ADS-B verisi, kaynak: OpenSky Network; ${Math.round(live.age_s / 60)} dk önce alındı, konumlar hız ve yöne göre tahmini ilerletilir). `
+      + `Plan ve ekip verisi uydurmadır.`;
+    if (schedule) drawMap();
+  } catch (e) { /* katman isteğe bağlı: hata sayfayı etkilemez */ }
+}
+refreshLive();
+setInterval(refreshLive, 60000);
+
 drawAxis();
+setupMapGestures();
 refresh().then(() => { if (!localStorage.getItem("tourSeen")) startTour(); });
 setInterval(refresh, 2000);                              // iş durumu birkaç saniyede bir yenilenir
 </script>

@@ -123,3 +123,27 @@ def test_pairing_options_explain_who_can_fly_it(client):
         "duty_after": 235,
     }
     assert client.get("/pairings/NOPE/options").status_code == 404
+
+
+def test_live_layer_is_off_by_default_and_parser_filters_thy():
+    from app import live
+
+    payload = {
+        "states": [
+            ["4baa01", "THY1591 ", "Turkey", 0, 0, 20.5, 45.1, 11000, False, 230, 310.0, -5.2],
+            ["b", "DLH123  ", "", 0, 0, 10.0, 50.0, 11000, False, 230, 90.0, 0],  # başka havayolu
+            ["c", "THY2130 ", "", 0, 0, 28.7, 41.2, 0, True, 0, 0.0, 0],  # yerde
+            ["d", "THY77   ", "", 0, 0, None, None, None, False, None, None, None],  # konumu yok
+        ]
+    }
+    assert live.parse_states(payload) == [
+        {
+            "callsign": "THY1591", "icao24": "4baa01", "country": "Turkey", "lon": 20.5, "lat": 45.1,
+            "heading": 310.0, "altitude_m": 11000, "speed_ms": 230, "vertical_ms": -5.2,
+        }
+    ]
+    assert live.parse_states({"states": None}) == []
+
+
+def test_live_endpoint_disabled_in_tests(client):
+    assert client.get("/live/thy").json() == {"enabled": False, "aircraft": []}

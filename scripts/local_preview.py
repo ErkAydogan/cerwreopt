@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # proje kökünden "app" import edilsin
 os.environ.setdefault("API_KEY", "demo-key")
+os.environ.setdefault("LIVE_TRAFFIC", "1")
 os.environ.setdefault("DATABASE_URL", "sqlite:///./local_preview.db")
 
 import uvicorn  # noqa: E402

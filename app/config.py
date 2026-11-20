@@ -18,6 +18,8 @@ class Settings:
     max_duty: int
     log_level: str
     git_sha: str
+    live_traffic: bool  # haritada gerçek THY uçak konumları (OpenSky) gösterilsin mi
+    live_ttl_s: float  # canlı veri bu kadar saniye bellekte tutulur
     public_url: str  # demonun dışarıdan erişilen adresi; doluysa arayüz bu adresin QR kodunu gösterir
 
 
@@ -32,6 +34,8 @@ def load() -> Settings:
         max_duty=int(os.environ.get("MAX_DUTY", str(13 * 60))),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
         git_sha=os.environ.get("GIT_SHA", "dev"),
+        live_traffic=os.environ.get("LIVE_TRAFFIC", "0") == "1",
+        live_ttl_s=float(os.environ.get("LIVE_TTL_S", "900")),
         public_url=os.environ.get("PUBLIC_URL", ""),
     )
 

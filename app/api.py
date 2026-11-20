@@ -13,11 +13,13 @@ from uuid import uuid4
 import segno
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import insert, select, text, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
-from app import aftn, broker, config, db, logging_json, model, seed
+from app import aftn, broker, config, db, live, logging_json, model, seed
+from app.airports import AIRPORTS
 from app.logging_json import log
 
 settings = config.load()
@@ -32,7 +34,9 @@ async def lifespan(app: FastAPI):
     yield
 
 
+STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="crewreopt", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")  # harita altlığı gibi sabit dosyalar
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -237,6 +241,7 @@ def get_schedule(ops_date: date | None = None):
     return {
         "date": ops_date.isoformat(),
         "rules": asdict(config.rules(settings)),
+        "airports": {icao: {"name": name, "lat": lat, "lon": lon} for icao, (name, lat, lon) in AIRPORTS.items()},
         "crews": [{"id": c.id, "is_standby": c.is_standby} for c in crew_rows],
         "pairings": list(pairings.values()),
     }
@@ -293,6 +298,14 @@ def health(publisher: broker.Publisher = Depends(get_publisher)):
     return JSONResponse(status_code=200 if healthy else 503, content={**checks, "git_sha": settings.git_sha})
 
 
+@app.get("/live/thy")
+def live_thy():
+    """Haritadaki canlı katman: bölgedeki THY çağrı kodlu uçakların anlık konumu (kaynak: OpenSky Network)."""
+    if not settings.live_traffic:
+        return {"enabled": False, "aircraft": []}
+    return {"enabled": True, "source": "OpenSky Network", **live.thy_aircraft(settings.live_ttl_s)}
+
+
 @app.get("/qr.svg", include_in_schema=False)
 def qr():
     """Demonun genel adresini QR olarak verir: izleyen kişi telefonundan açıp kendisi deneyebilir."""
@@ -305,4 +318,4 @@ def qr():
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+    return FileResponse(STATIC_DIR / "index.html")

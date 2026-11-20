@@ -123,6 +123,21 @@ C1 ekibi P01'i (THY1591/1592) uçup 14:10'da dönecek, 15:15'te P02'ye çıkacak
 dönüş 15:40 olur; dinlenme −25 dk. O saatte boşta normal ekip yok, bu yüzden tek bir görev yedek ekibe geçer.
 Beklenen: 1 değişiklik, amaç 130 (100 + 30), `OPTIMAL`.
 
+### 2) İptal: THY2412 iptal olur
+
+```
+FF LTFMZPZX
+231210 LTAIZPZX
+(CNL-THY2412-LTFM1500-LTAI-DOF/261123)
+```
+
+C3'ün öğleden sonraki görevi (P08) düşer.
+
+- **1'den sonra gönderilirse** plan aynı kalır: yedekteki görevi C3'e almak bir değişikliktir (100), kazancı
+  bir yedek (30). Model kararlılığı tercih eder; bu ağırlıklar bir iş kararıdır.
+- **Sıfırlayıp önce 2, sonra 1 gönderilirse** P02 yedeğe değil boşa çıkan C3'e gider: amaç 100, yedek
+  kullanılmaz.
+
 ### 3) Fırtına: NOTAM ile meydan kapanışı, uzun süren iş, çökme provası
 
 Arayüzdeki **Fırtına senaryosu** kartındaki üç düğme sırayla:
@@ -147,21 +162,6 @@ değişir, 13 yedek devreye girer, amaç 3190, `OPTIMAL`. Çökme provası kurul
 `job finished (succeeded)`.
 
 Desteklenen tek NOTAM türü meydan kapanışıdır (Q-kodu `QFALC`); diğerleri nedeniyle birlikte dead-letter olur.
-
-### 2) İptal: THY2412 iptal olur
-
-```
-FF LTFMZPZX
-231210 LTAIZPZX
-(CNL-THY2412-LTFM1500-LTAI-DOF/261123)
-```
-
-C3'ün öğleden sonraki görevi (P08) düşer.
-
-- **1'den sonra gönderilirse** plan aynı kalır: yedekteki görevi C3'e almak bir değişikliktir (100), kazancı
-  bir yedek (30). Model kararlılığı tercih eder; bu ağırlıklar bir iş kararıdır.
-- **Sıfırlayıp önce 2, sonra 1 gönderilirse** P02 yedeğe değil boşa çıkan C3'e gider: amaç 100, yedek
-  kullanılmaz.
 
 `curl` ile:
 

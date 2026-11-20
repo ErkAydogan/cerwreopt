@@ -38,7 +38,7 @@ def test_delay_breaks_rest_and_one_change_fixes_it():
     assert result.solver_status == "OPTIMAL"
     assert len(result.changes) == 1
     assert result.changes[0]["to"] == "S1"
-    assert "rest between P1 and P2 would be -30 min" in result.changes[0]["reason"]
+    assert "P1 and P2 would overlap by 30 min" in result.changes[0]["reason"]
     assert result.objective == 130
     assert result.gap == 0
     assert result.trace and result.trace[-1]["objective"] == 130  # çözücü ilerlemesi kaydedildi

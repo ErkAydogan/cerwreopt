@@ -44,7 +44,9 @@ def run_job(engine: Engine, settings: config.Settings, job_id: str, redelivered:
         if not claim(conn, job_id, redelivered):
             log(logger, logging.INFO, "job not claimable (duplicate delivery), skipping", job_id=job_id)
             return "skipped"
-        job = conn.execute(select(db.jobs.c.ops_date, db.jobs.c.attempts).where(db.jobs.c.id == job_id)).one()
+        job = conn.execute(
+            select(db.jobs.c.ops_date, db.jobs.c.attempts, db.jobs.c.params).where(db.jobs.c.id == job_id)
+        ).one()
     log(logger, logging.INFO, "job claimed", job_id=job_id, attempts=job.attempts, redelivered=redelivered)
 
     if job.attempts > MAX_ATTEMPTS:
@@ -57,15 +59,17 @@ def run_job(engine: Engine, settings: config.Settings, job_id: str, redelivered:
     with engine.begin() as conn:
         pairings = db.load_pairings(conn, job.ops_date)
         crews = db.load_crews(conn)
-        rules = model.Rules(
-            min_rest=settings.min_rest, max_duty=settings.max_duty, time_limit_s=settings.solver_time_limit_s
-        )
+        rules = config.rules(settings, job.params)
+        broken = model.violations(pairings, rules)  # mesaj mevcut planda neyi bozdu?
         snapshot = {
             "pairings": [asdict(p) for p in pairings],
             "crews": [asdict(c) for c in crews],
             "rules": asdict(rules),
         }
-        conn.execute(update(db.jobs).where(db.jobs.c.id == job_id).values(input_snapshot=snapshot))
+        conn.execute(
+            update(db.jobs).where(db.jobs.c.id == job_id).values(input_snapshot=snapshot, violations=broken)
+        )
+    log(logger, logging.INFO, "input loaded", job_id=job_id, pairings=len(pairings), violations=broken)
 
     # 2) Modeli çalıştır (saf fonksiyon)
     result = model.solve(pairings, crews, rules)
@@ -98,6 +102,7 @@ def run_job(engine: Engine, settings: config.Settings, job_id: str, redelivered:
                 solver_status=result.solver_status, objective=result.objective, best_bound=result.best_bound,
                 gap=result.gap, solve_seconds=result.solve_seconds,
                 changes=result.changes, trace=result.trace, infeasible_core=result.infeasible_core,
+                standby_used=result.standby_used,
             )
         )
     level = logging.INFO if status == "succeeded" else logging.ERROR

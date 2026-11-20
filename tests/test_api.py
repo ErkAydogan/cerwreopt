@@ -110,3 +110,16 @@ def test_job_and_schedule_are_readable(client):
     assert client.get("/jobs/nope").status_code == 404
     schedule = client.get("/schedule").json()
     assert len(schedule["pairings"]) == 14 and len(schedule["crews"]) == 7
+
+
+def test_pairing_options_explain_who_can_fly_it(client):
+    client.post("/messages", content=DLA)  # gecikme uygulandı, henüz çözülmedi
+    options = {o["crew"]: o for o in client.get("/pairings/P02/options").json()["options"]}
+    assert options["C1"]["current"] and not options["C1"]["feasible"]  # mevcut ekip artık uçamaz
+    assert "P01 and P02 would overlap by 25 min" in options["C1"]["reason"]
+    assert not options["C3"]["feasible"] and "P08" in options["C3"]["reason"]
+    assert options["S1"] == {
+        "crew": "S1", "is_standby": True, "current": False, "feasible": True, "reason": None, "cost": 130,
+        "duty_after": 235,
+    }
+    assert client.get("/pairings/NOPE/options").status_code == 404

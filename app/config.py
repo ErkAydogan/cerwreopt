@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from datetime import date
 
+from app.model import Rules
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -31,4 +33,14 @@ def load() -> Settings:
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
         git_sha=os.environ.get("GIT_SHA", "dev"),
         public_url=os.environ.get("PUBLIC_URL", ""),
+    )
+
+
+def rules(settings: Settings, overrides: dict | None = None) -> Rules:
+    """Modelin kural ve ağırlıkları: ortam değişkenleri + (varsa) işe özel değişiklikler."""
+    return Rules(
+        min_rest=settings.min_rest,
+        max_duty=settings.max_duty,
+        time_limit_s=settings.solver_time_limit_s,
+        **(overrides or {}),
     )

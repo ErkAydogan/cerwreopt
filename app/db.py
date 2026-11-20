@@ -85,6 +85,9 @@ jobs = Table(
     Column("changes", JSON),
     Column("trace", JSON),
     Column("infeasible_core", JSON),
+    Column("standby_used", Integer),
+    Column("violations", JSON),  # çözümden önce mevcut planın bozduğu kurallar
+    Column("params", JSON),  # elle başlatılan işte ağırlık değişiklikleri (what-if)
     Column("error", Text),
     Column("input_snapshot", JSON),  # modele verilen girdi: sonucu sonradan aynen yeniden üretebilmek için
 )

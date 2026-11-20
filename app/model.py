@@ -46,6 +46,7 @@ class SolveResult:
     solve_seconds: float = 0.0
     trace: list[dict] = field(default_factory=list)  # her yeni çözüm: {t, objective, bound}
     infeasible_core: list[str] = field(default_factory=list)  # birlikte karşılanamayan görevler
+    standby_used: int = 0  # kullanılan yedek ekip sayısı (amaç değerinin dökümü için)
 
     @property
     def has_solution(self) -> bool:
@@ -160,11 +161,31 @@ def solve(pairings: list[Pairing], crews: list[Crew], rules: Rules | None = None
             reason = explain_change(p, result.assignment, by_id, rules)
             result.changes.append({"pairing": p.id, "from": p.current_crew, "to": new_crew, "reason": reason})
 
+    result.standby_used = sum(solver.value(u) for u in used.values())
     result.objective = _clean(solver.objective_value)
     result.best_bound = _clean(solver.best_objective_bound)
     # Göreli boşluk: 0 ise optimum kanıtlandı. Amaç 0 iken bölme yapmıyoruz.
     result.gap = 0.0 if result.objective == 0 else abs(result.objective - result.best_bound) / abs(result.objective)
     return result
+
+
+def why_not(p: Pairing, crew_id: str, on_crew: list[Pairing], rules: Rules) -> str | None:
+    """p görevi, elinde on_crew görevleri olan ekibe verilebilir mi? Verilemezse bozulan ilk kuralı döndürür.
+    Çözücüdeki kuralların düz Python hali; 'neden bu ekip değil?' sorusunu çözücüyü çalıştırmadan cevaplar."""
+    for q in on_crew:
+        first, second = sorted((p, q), key=lambda r: r.start)
+        rest = second.start - first.end
+        if rest < 0:
+            return f"{crew_id} flies {q.id}: {first.id} and {second.id} would overlap by {-rest} min"
+        if rest < rules.min_rest:
+            return (
+                f"{crew_id} flies {q.id}: rest between {first.id} and {second.id} "
+                f"would be {rest} min (< {rules.min_rest})"
+            )
+    duty = sum(q.duration for q in on_crew) + p.duration
+    if duty > rules.max_duty:
+        return f"{crew_id} would reach {duty} min duty (> {rules.max_duty})"
+    return None
 
 
 def explain_change(p: Pairing, assignment: dict[str, str], by_id: dict[str, Pairing], rules: Rules) -> str:
@@ -173,18 +194,24 @@ def explain_change(p: Pairing, assignment: dict[str, str], by_id: dict[str, Pair
     if old is None:
         return "was unassigned"
     kept = [by_id[q] for q, e in assignment.items() if e == old]
-    for q in kept:
-        first, second = sorted((p, q), key=lambda r: r.start)
-        rest = second.start - first.end
-        if rest < rules.min_rest:
-            return (
-                f"{old} flies {q.id}: rest between {first.id} and {second.id} "
-                f"would be {rest} min (< {rules.min_rest})"
-            )
-    duty = sum(q.duration for q in kept) + p.duration
-    if duty > rules.max_duty:
-        return f"{old} would reach {duty} min duty (> {rules.max_duty})"
-    return f"moved so {old} can cover another pairing at lower total cost"
+    return why_not(p, old, kept, rules) or "no rule forces this move; it lowers the total cost"
+
+
+def violations(pairings: list[Pairing], rules: Rules) -> list[str]:
+    """Mevcut plan (current_crew) hangi kuralları bozuyor? Çözümden ÖNCE çalışır: gelen mesajın etkisini gösterir."""
+    active = [p for p in pairings if not p.cancelled and p.current_crew]
+    by_id = {p.id: p for p in active}
+    found = []
+    for a, b in conflicting_pairs(active, rules.min_rest):
+        if by_id[a].current_crew == by_id[b].current_crew:
+            rest = by_id[b].start - by_id[a].end
+            problem = f"overlap by {-rest} min" if rest < 0 else f"have {rest} min rest (< {rules.min_rest})"
+            found.append(f"{by_id[a].current_crew}: {a} and {b} {problem}")
+    for crew_id in sorted({p.current_crew for p in active}):
+        duty = sum(p.duration for p in active if p.current_crew == crew_id)
+        if duty > rules.max_duty:
+            found.append(f"{crew_id}: duty is {duty} min (> {rules.max_duty})")
+    return found
 
 
 def explain_infeasibility(pairings: list[Pairing], crews: list[Crew], rules: Rules) -> list[str]:

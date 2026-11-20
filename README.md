@@ -84,7 +84,7 @@ ruff check . && pytest -q
 
 Çıktıda atamanın yanında şunlar da var:
 
-- **Gerekçe:** her değişiklik için düz metin, örn. `C1 flies P01: rest between P01 and P02 would be -25 min (< 60)`.
+- **Gerekçe:** her değişiklik için düz metin, örn. `C1 flies P01: P01 and P02 would overlap by 25 min`.
 - **Çözücü izi:** bulunan her çözümde amaç ve en iyi sınır; arayüzde gap'in kapanışı çizilir.
 - **Çözümsüzlük teşhisi:** `INFEASIBLE` çoğu zaman veri hatasıdır. Her görevin "karşılansın" kuralı bir
   varsayım (assumption) literaline bağlanır, CP-SAT çelişen varsayımları döndürür, küçültme ile birlikte

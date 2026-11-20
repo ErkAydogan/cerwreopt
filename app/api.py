@@ -5,18 +5,19 @@ import io
 import logging
 import secrets
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
 import segno
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import insert, select, text, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
-from app import aftn, broker, config, db, logging_json, seed
+from app import aftn, broker, config, db, logging_json, model, seed
 from app.logging_json import log
 
 settings = config.load()
@@ -81,7 +82,7 @@ def find_job(conn: Connection, key: str):
     return conn.execute(select(db.jobs.c.id, db.jobs.c.status).where(db.jobs.c.idempotency_key == key)).first()
 
 
-def create_job_once(key: str, ops_date: date, trigger: str, before_insert=None) -> tuple[str, str, bool]:
+def create_job_once(key: str, ops_date: date, trigger: str, before_insert=None, params=None) -> tuple[str, str, bool]:
     """İşi en fazla bir kez oluşturur; (job_id, status, duplicate) döner.
     Önce anahtara bakar; yarış durumunda son sözü unique constraint söyler."""
     try:
@@ -94,7 +95,7 @@ def create_job_once(key: str, ops_date: date, trigger: str, before_insert=None) 
             job_id = str(uuid4())
             conn.execute(
                 insert(db.jobs).values(
-                    id=job_id, idempotency_key=key, ops_date=ops_date, trigger=trigger, status="queued"
+                    id=job_id, idempotency_key=key, ops_date=ops_date, trigger=trigger, status="queued", params=params
                 )
             )
             return job_id, "queued", False
@@ -149,13 +150,19 @@ async def post_message(request: Request, publisher: broker.Publisher = Depends(g
 @app.post("/jobs", dependencies=[Depends(require_api_key)])
 def post_job(
     ops_date: date | None = None,
+    change_penalty: int | None = Query(default=None, ge=0),
+    standby_penalty: int | None = Query(default=None, ge=0),
     idempotency_key: str | None = Header(default=None),
     publisher: broker.Publisher = Depends(get_publisher),
 ):
-    """Elle yeniden planlama. İstemci Idempotency-Key gönderirse tekrar denemeler aynı işi döndürür."""
+    """Elle yeniden planlama. İstemci Idempotency-Key gönderirse tekrar denemeler aynı işi döndürür.
+    Ağırlıklar verilirse sadece bu iş için geçerlidir: 'yedek daha pahalı olsaydı plan ne olurdu?'"""
     ops_date = ops_date or settings.ops_date
+    weights = {"change_penalty": change_penalty, "standby_penalty": standby_penalty}
+    params = {name: value for name, value in weights.items() if value is not None}
+    trigger = "manual" + (f" {params}" if params else "")
     key = f"reopt:{ops_date.isoformat()}:manual:{idempotency_key or uuid4()}"
-    job_id, status, duplicate = create_job_once(key, ops_date, "manual")
+    job_id, status, duplicate = create_job_once(key, ops_date, trigger, params=params or None)
     return enqueue(job_id, status, duplicate, publisher)
 
 
@@ -229,9 +236,42 @@ def get_schedule(ops_date: date | None = None):
         )
     return {
         "date": ops_date.isoformat(),
-        "rules": {"min_rest": settings.min_rest, "max_duty": settings.max_duty},
+        "rules": asdict(config.rules(settings)),
         "crews": [{"id": c.id, "is_standby": c.is_standby} for c in crew_rows],
         "pairings": list(pairings.values()),
+    }
+
+
+@app.get("/pairings/{pairing_id}/options")
+def pairing_options(pairing_id: str, ops_date: date | None = None):
+    """Bu görevi hangi ekipler uçabilir? Her ekip için: uygun mu, değilse hangi kural bozulur, uygunsa maliyeti.
+    Çözücü çalışmaz; modeldeki kuralların düz Python hali (model.why_not) kullanılır."""
+    with engine.connect() as conn:
+        pairings = db.load_pairings(conn, ops_date or settings.ops_date)
+        crews = db.load_crews(conn)
+    target = next((p for p in pairings if p.id == pairing_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="pairing not found")
+    rules = config.rules(settings)
+    others = [p for p in pairings if not p.cancelled and p.id != pairing_id]
+    options = []
+    for crew in crews:
+        on_crew = [p for p in others if p.current_crew == crew.id]
+        reason = model.why_not(target, crew.id, on_crew, rules)
+        is_current = crew.id == target.current_crew
+        # Maliyet amaç fonksiyonuyla aynı: değişiklik + (boştaki bir yedek devreye giriyorsa) yedek
+        activates_standby = crew.is_standby and not on_crew
+        cost = 0 if is_current else rules.change_penalty + (rules.standby_penalty if activates_standby else 0)
+        options.append(
+            {
+                "crew": crew.id, "is_standby": crew.is_standby, "current": is_current,
+                "feasible": reason is None, "reason": reason, "cost": cost if reason is None else None,
+                "duty_after": sum(p.duration for p in on_crew) + target.duration,
+            }
+        )
+    return {
+        "pairing": pairing_id, "start": target.start, "end": target.end, "duration": target.duration,
+        "locked": target.locked, "cancelled": target.cancelled, "options": options,
     }
 
 

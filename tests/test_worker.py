@@ -33,7 +33,7 @@ def test_demo1_delay_is_fixed_with_one_change_to_standby(client, engine):
     assert len(job.changes) == 1
     change = job.changes[0]
     assert change["from"] == "C1" and change["to"] in ("S1", "S2")
-    assert "rest between P01 and P02 would be -25 min" in change["reason"]
+    assert "P01 and P02 would overlap by 25 min" in change["reason"]
     assert crew_of(engine, change["pairing"]) == change["to"]
     # Girdi anlık görüntüsü saklandı ve API'den okunabiliyor
     snapshot = client.get(f"/jobs/{job_id}/input").json()
@@ -90,3 +90,24 @@ def test_infeasible_job_fails_with_diagnosis_and_keeps_plan(client, engine):
     assert job.infeasible_core == ["P01"]  # teşhis doğrudan bozuk görevi gösteriyor
     assert "check input data" in job.error
     assert crew_of(engine, "P02") == "C1"  # başarısız iş mevcut plana dokunmaz
+
+
+def test_job_records_what_the_message_broke(client, engine):
+    job_id = submit(client, DLA)
+    worker.run_job(engine, api.settings, job_id)
+    job = job_row(engine, job_id)
+    assert job.violations == ["C1: P01 and P02 overlap by 25 min"]
+    assert job.standby_used == 1
+
+
+def test_what_if_weights_change_the_decision(client, engine):
+    # DLA sonra CNL: varsayılan ağırlıklarla P02 yedekte kalır (geri almak 100, kazanç 30).
+    for message in (DLA, CNL):
+        worker.run_job(engine, api.settings, submit(client, message))
+    assert crew_of(engine, "P02") in ("S1", "S2")
+    # Yedek 150 olsaydı: görevi boşa çıkan C3'e almak (100) yedeği tutmaktan (150) ucuz.
+    job_id = client.post("/jobs", params={"standby_penalty": 150}).json()["job_id"]
+    assert worker.run_job(engine, api.settings, job_id) == "succeeded"
+    job = job_row(engine, job_id)
+    assert job.objective == 100 and job.standby_used == 0
+    assert crew_of(engine, "P02") == "C3"

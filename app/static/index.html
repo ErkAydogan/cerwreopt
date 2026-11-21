@@ -53,6 +53,18 @@
   textarea { height:84px; resize:vertical; }
   button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; margin:8px 6px 0 0; }
   button.primary { background:var(--ink); color:#fff; border-color:var(--ink); }
+  button:hover { border-color:var(--muted); } button:active { transform:translateY(1px); filter:brightness(.92); }
+  /* Basılan düğme: iş bitene kadar soluk ve dönen işaretli */
+  button:disabled { opacity:.6; cursor:wait; }
+  button.busy::after { content:""; display:inline-block; width:10px; height:10px; margin-left:8px; vertical-align:-1px;
+                       border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .stepstate { font-size:12px; margin:4px 0 0; color:var(--muted); }
+  .stepstate.ok { color:var(--ok); font-weight:600; } .stepstate.err { color:var(--bad); font-weight:600; } .stepstate.wait { color:var(--leg); font-weight:600; }
+  /* Kısa bildirim: sağ üstte belirir, birkaç saniye sonra kaybolur */
+  #toast { position:fixed; top:16px; right:16px; z-index:200; background:var(--ink); color:#fff; padding:10px 14px; border-radius:8px;
+           box-shadow:0 6px 24px rgba(0,0,0,.3); opacity:0; transform:translateY(-8px); transition:opacity .2s, transform .2s; pointer-events:none; max-width:340px; }
+  #toast.show { opacity:1; transform:none; } #toast.err { background:var(--bad); }
   .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; color:#fff; background:var(--muted); }
   .badge.succeeded { background:var(--ok); } .badge.failed, .badge.timed_out { background:var(--bad); } .badge.running { background:var(--leg); }
   table { border-collapse:collapse; width:100%; } td, th { padding:4px 8px 4px 0; vertical-align:top; text-align:left; }
@@ -172,21 +184,21 @@
 231200 EDDFZQZX
 (DLA-THY1591-LTFM0830-EDDF-DOF/261123)</textarea>
       <input id="apikey" placeholder="X-API-Key" value="demo-key" style="margin-top:8px">
-      <button class="primary" onclick="sendMessage()">Gönder</button>
+      <button class="primary" onclick="sendMessage(this)">Gönder</button>
       <button onclick="fill(DEMO_DLA)">Örnek DLA</button>
       <button onclick="fill(DEMO_CNL)">Örnek CNL</button>
-      <button onclick="resetData()">Veriyi sıfırla</button>
+      <button onclick="resetData(this)">Veriyi sıfırla</button>
       <div id="response" class="mono muted"></div>
     </div>
     <div class="card" id="card-storm">
       <h2>Fırtına senaryosu</h2>
       <p class="hint">Uzun süren bir optimizasyon işi: tetiklenir, izlenir, çöker ve yine de tamamlanır.</p>
-      <button onclick="loadBigDay()">1 · Büyük günü yükle</button>
-      <div class="hint" style="margin:4px 0 0">150 görev, 97 ekip (25 yedek)</div>
-      <button onclick="armChaos()">2 · Çökme provasını kur</button>
-      <div class="hint" style="margin:4px 0 0">Worker, iş 2 sn sürdükten sonra aniden kapanır (isteğe bağlı)</div>
-      <button class="primary" onclick="sendStorm()">3 · NOTAM: İstanbul 2 saat kapalı</button>
-      <div class="hint" style="margin:4px 0 0">08:00–10:00 arası kalkış ve inişler ertelenir; onlarca ekibin planı bozulur</div>
+      <button onclick="loadBigDay(this)">1 · Büyük günü yükle</button>
+      <div class="stepstate" id="storm-1">150 görev, 97 ekip (25 yedek)</div>
+      <button onclick="armChaos(this)">2 · Çökme provasını kur</button>
+      <div class="stepstate" id="storm-2">Worker, iş 2 sn sürdükten sonra aniden kapanır (isteğe bağlı)</div>
+      <button class="primary" onclick="sendStorm(this)">3 · NOTAM: İstanbul 2 saat kapalı</button>
+      <div class="stepstate" id="storm-3">08:00–10:00 arası kalkış ve inişler ertelenir; onlarca ekibin planı bozulur</div>
     </div>
     <div class="card" id="card-weights">
       <h2>Ağırlıklarla yeniden çöz</h2>
@@ -195,7 +207,7 @@
         <label>değişiklik (a)<input id="w-change" type="number" min="0" value="100"></label>
         <label>yedek (b)<input id="w-standby" type="number" min="0" value="30"></label>
       </div>
-      <button onclick="resolve()">Bu ağırlıklarla çöz</button>
+      <button onclick="resolve(this)">Bu ağırlıklarla çöz</button>
     </div>
     <div class="card">
       <h2>İş geçmişi</h2>
@@ -205,6 +217,7 @@
 </main>
 
 <!-- Tanıtım turu kutusu; adımlar aşağıdaki TOUR dizisinde -->
+<div id="toast" role="status"></div>
 <div id="tour-dim" hidden></div>
 <div id="tour" hidden>
   <div class="step" id="tour-step"></div>
@@ -241,15 +254,79 @@ function fill(text) { $("message").value = text; }
 
 async function post(path, body) {
   const r = await fetch(path, { method: "POST", body, headers: { "X-API-Key": $("apikey").value } });
-  $("response").textContent = r.status + " " + JSON.stringify(await r.json(), null, 1);
+  const data = await r.json();
+  $("response").textContent = r.status + " " + JSON.stringify(data, null, 1);
   refresh();
+  if (!r.ok) throw new Error(data.error || data.detail?.error || data.detail || "istek reddedildi (" + r.status + ")");
+  return data;
 }
-const sendMessage = () => post("/messages", $("message").value);
-const resetData = () => { selected = null; post("/admin/reset", ""); };
-const loadBigDay = () => { selected = null; post("/admin/reset?size=big", ""); };
-const armChaos = () => post("/admin/chaos", "");
-const sendStorm = () => { fill(DEMO_NOTAM); post("/messages", DEMO_NOTAM); };
-const resolve = () => post(`/jobs?change_penalty=${$("w-change").value}&standby_penalty=${$("w-standby").value}`, "");
+
+// Kısa bildirim
+let toastTimer = null;
+function toast(text, isError) {
+  $("toast").textContent = text;
+  $("toast").className = "show" + (isError ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $("toast").className = "", 3500);
+}
+// Adım durumu: düğmenin altındaki satır (wait = sürüyor, ok = bitti, err = hata)
+function stepState(id, text, kind) { if (id) { $(id).textContent = text; $(id).className = "stepstate " + kind; } }
+
+// Her düğme buradan geçer: basılınca kilitlenir ve döner; iş bitince sonucu bildirir
+async function act(button, stateId, run) {
+  if (button) { button.disabled = true; button.classList.add("busy"); }
+  stepState(stateId, "çalışıyor…", "wait");
+  try {
+    const message = await run();
+    stepState(stateId, "✓ " + message, "ok");
+    toast("✓ " + message);
+  } catch (e) {
+    stepState(stateId, "✗ " + e.message, "err");
+    toast("✗ " + e.message, true);
+  } finally {
+    if (button) { button.disabled = false; button.classList.remove("busy"); }
+  }
+}
+
+// İşin sonucunu tek cümleyle özetler
+function jobSummary(job) {
+  if (job.status !== "succeeded") return `iş ${job.status}: ${job.error || ""}`;
+  const retry = job.attempts > 1 ? `, ${job.attempts}. denemede (worker çöktü, iş devralındı)` : "";
+  return `çözüldü: ${(job.changes || []).length} değişiklik, ${job.standby_used ?? 0} yedek${retry}`;
+}
+async function sendAndWait(message) {
+  const sent = await post("/messages", message);
+  if (!sent.job_id) return "uçuş durumu güncellendi";
+  if (sent.duplicate) return "bu mesaj daha önce işlendi (yeni iş açılmadı)";
+  return jobSummary(await waitForJob());
+}
+
+const sendMessage = button => act(button, null, () => sendAndWait($("message").value));
+const resetData = button => act(button, null, async () => {
+  selected = null;
+  await post("/admin/reset", "");
+  ["storm-1", "storm-2", "storm-3"].forEach(id => $(id).className = "stepstate");
+  return "veri sıfırlandı: 14 görev, 7 ekip";
+});
+const loadBigDay = button => act(button, "storm-1", async () => {
+  selected = null;
+  await post("/admin/reset?size=big", "");
+  return "büyük gün yüklendi: 150 görev, 97 ekip";
+});
+const armChaos = button => act(button, "storm-2", async () => {
+  await post("/admin/chaos", "");
+  return "kuruldu: worker bir sonraki uzun işte kapanacak";
+});
+const sendStorm = button => act(button, "storm-3", async () => {
+  fill(DEMO_NOTAM);
+  stepState("storm-3", "NOTAM gönderildi, çözücü çalışıyor… (aşağıda 'Son iş')", "wait");
+  $("card-job").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  return sendAndWait(DEMO_NOTAM);
+});
+const resolve = button => act(button, null, async () => {
+  await post(`/jobs?change_penalty=${$("w-change").value}&standby_penalty=${$("w-standby").value}`, "");
+  return jobSummary(await waitForJob());
+});
 
 function drawAxis() {
   let html = "";
@@ -539,13 +616,16 @@ async function refresh() {
 // --- Tanıtım turu ------------------------------------------------------------------------------
 // Her adım: başlık, metin, (varsa) vurgulanacak kart ve adıma girerken yapılacak iş (before).
 const sleep = ms => new Promise(done => setTimeout(done, ms));
-async function waitForJob() {                            // son iş bitene kadar bekle (en çok 10 sn)
-  for (let i = 0; i < 20; i++) {
+async function waitForJob() {                            // son iş bitene kadar bekle (en çok 90 sn), işi döndür
+  let job = null;
+  for (let i = 0; i < 180; i++) {
     const jobs = await fetch("/jobs").then(r => r.json());
-    if (jobs.length && !["queued", "running"].includes(jobs[0].status)) break;
+    job = jobs[0];
+    if (job && !["queued", "running"].includes(job.status)) break;
     await sleep(500);
   }
   await refresh();
+  return job;
 }
 const TOUR = [
   { title: "Bu demo ne yapıyor?",

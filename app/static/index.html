@@ -59,6 +59,10 @@
   button.busy::after { content:""; display:inline-block; width:10px; height:10px; margin-left:8px; vertical-align:-1px;
                        border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:spin .7s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
+  /* Fırtına adımları: biten adım yeşil ve işaretli, sıradaki adım koyu */
+  .step-btn.done { background:#ebfbee; border-color:var(--ok); color:var(--ok); font-weight:600; }
+  .step-btn.done::before { content:"✓ "; }
+  .step-btn.next { background:var(--ink); color:#fff; border-color:var(--ink); }
   .stepstate { font-size:12px; margin:4px 0 0; color:var(--muted); }
   .stepstate.ok { color:var(--ok); font-weight:600; } .stepstate.err { color:var(--bad); font-weight:600; } .stepstate.wait { color:var(--leg); font-weight:600; }
   /* Kısa bildirim: sağ üstte belirir, birkaç saniye sonra kaybolur */
@@ -193,16 +197,16 @@
     <div class="card" id="card-storm">
       <h2>Fırtına senaryosu</h2>
       <p class="hint">Uzun süren bir optimizasyon işi: tetiklenir, izlenir, çöker ve yine de tamamlanır.</p>
-      <button onclick="loadBigDay(this)">1 · Büyük günü yükle</button>
+      <button class="step-btn" id="step-btn-1" onclick="loadBigDay(this)">1 · Büyük günü yükle</button>
       <div class="stepstate" id="storm-1">150 görev, 97 ekip (25 yedek)</div>
-      <button onclick="armChaos(this)">2 · Çökme provasını kur</button>
+      <button class="step-btn" id="step-btn-2" onclick="armChaos(this)">2 · Çökme provasını kur</button>
       <div class="stepstate" id="storm-2">Worker, iş 2 sn sürdükten sonra aniden kapanır (isteğe bağlı)</div>
-      <button class="primary" onclick="sendStorm(this)">3 · NOTAM: İstanbul 2 saat kapalı</button>
+      <button class="step-btn" id="step-btn-3" onclick="sendStorm(this)">3 · NOTAM: İstanbul 2 saat kapalı</button>
       <div class="stepstate" id="storm-3">08:00–10:00 arası kalkış ve inişler ertelenir; onlarca ekibin planı bozulur</div>
     </div>
     <div class="card" id="card-weights">
       <h2>Ağırlıklarla yeniden çöz</h2>
-      <p class="hint">Amaç = değişiklik × a + kullanılan yedek × b. Ağırlığı değiştirin, kararın nasıl döndüğünü görün.</p>
+      <p class="hint">Sistem iki şeyi istemez: bir uçuşun ekibini değiştirmek (a puan ceza) ve evdeki yedek ekibi çağırmak (b puan ceza). Toplam cezası en düşük planı seçer. Sayıları değiştirip çözün, kararın nasıl değiştiğini görün.</p>
       <div class="weights">
         <label>değişiklik (a)<input id="w-change" type="number" min="0" value="100"></label>
         <label>yedek (b)<input id="w-standby" type="number" min="0" value="30"></label>
@@ -279,13 +283,36 @@ async function act(button, stateId, run) {
   try {
     const message = await run();
     stepState(stateId, "✓ " + message, "ok");
+    if (button && button.classList.contains("step-btn")) markStep(button.id, true);
     toast("✓ " + message);
   } catch (e) {
     stepState(stateId, "✗ " + e.message, "err");
+    if (button && button.classList.contains("step-btn")) markStep(button.id, false);
     toast("✗ " + e.message, true);
   } finally {
     if (button) { button.disabled = false; button.classList.remove("busy"); }
   }
+}
+
+// Fırtına adımları: hangisi bitti, sıradaki hangisi? (2. adım isteğe bağlı: atlanabilir)
+const STEP_HINTS = {};                                   // her adımın ilk açıklama metni, sıfırlamada geri yazılır
+function markStep(buttonId, ok) {
+  $(buttonId).classList.toggle("done", ok);
+  if (buttonId === "step-btn-1" && ok) {                 // yeni büyük gün: sonraki adımlar baştan
+    ["step-btn-2", "step-btn-3"].forEach(id => $(id).classList.remove("done"));
+    ["storm-2", "storm-3"].forEach(id => { $(id).textContent = STEP_HINTS[id]; $(id).className = "stepstate"; });
+  }
+  updateNextStep();
+}
+function updateNextStep() {
+  const done = id => $(id).classList.contains("done");
+  const next = !done("step-btn-1") ? "step-btn-1" : !done("step-btn-3") ? "step-btn-3" : null;
+  ["step-btn-1", "step-btn-2", "step-btn-3"].forEach(id => $(id).classList.toggle("next", id === next));
+}
+function resetSteps() {
+  ["step-btn-1", "step-btn-2", "step-btn-3"].forEach(id => $(id).classList.remove("done"));
+  Object.entries(STEP_HINTS).forEach(([id, text]) => { $(id).textContent = text; $(id).className = "stepstate"; });
+  updateNextStep();
 }
 
 // İşin sonucunu tek cümleyle özetler
@@ -305,7 +332,7 @@ const sendMessage = button => act(button, null, () => sendAndWait($("message").v
 const resetData = button => act(button, null, async () => {
   selected = null;
   await post("/admin/reset", "");
-  ["storm-1", "storm-2", "storm-3"].forEach(id => $(id).className = "stepstate");
+  resetSteps();
   return "veri sıfırlandı: 14 görev, 7 ekip";
 });
 const loadBigDay = button => act(button, "storm-1", async () => {
@@ -634,7 +661,7 @@ const TOUR = [
            hangi kuralın bozulduğunu bulur ve planı <b>en az değişiklikle</b> onarır.</p>
            <p class="muted">Tur yaklaşık 1 dakika sürer ve örnek bir gecikmeyi sizin yerinize oynatır.</p>` },
   { target: "#card-map", title: "Bugünkü uçuşlar",
-    before: async () => { selected = null; await post("/admin/reset", ""); },
+    before: async () => { selected = null; await post("/admin/reset", ""); resetSteps(); },
     text: `<p>İstanbul'dan çıkıp aynı gün geri dönen 14 gidiş-dönüş uçuş. Her yay bir gidiş-dönüş.</p>
            <p>Sağdaki kutular günün özetini verir. Bir uçuş gecikince ya da iptal olunca rota renk değiştirir.</p>` },
   { target: "#card-gantt", title: "Günün planı",
@@ -724,6 +751,8 @@ setInterval(refreshLive, 60000);
 
 drawAxis();
 setupMapGestures();
+["storm-1", "storm-2", "storm-3"].forEach(id => STEP_HINTS[id] = $(id).textContent);
+updateNextStep();
 refresh().then(() => { if (!localStorage.getItem("tourSeen")) startTour(); });
 setInterval(refresh, 1000);                              // iş durumu ve canlı çözücü izi saniyede bir yenilenir
 </script>
